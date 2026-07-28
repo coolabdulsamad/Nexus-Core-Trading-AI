@@ -1,18 +1,15 @@
 """
 src/memory/qdrant_memory.py
 FIXED:
-- Deterministic UNIQUE point IDs (uuid5 of symbol+timestamp). The old
-  epoch-ms ID made AAPL/TSLA/MSFT/... overwrite each other at the same
-  timestamp - the memory silently kept only ONE symbol per bar.
-- Numeric epoch 'ts' payload field so searches can be time-filtered
-  (this is what makes look-ahead-free backtesting possible).
+- Deterministic UNIQUE point IDs (uuid5 of symbol+timestamp).
+- Numeric epoch 'ts' payload field for time-filtered search (look-ahead guard).
 - Regime label stored per point; searches can be regime-filtered.
-- search_similar uses the modern query_points API (qdrant-client >=1.10
-  deprecated and then REMOVED client.search); falls back to the legacy
-  call only if an old client is installed.
-
-NOTE: after upgrading, rebuild the memory (python -m src.memory.build_memory)
-- old points use the colliding ID scheme.
+- search_similar uses the modern query_points API (client.search was removed
+  in recent qdrant-client releases); legacy fallback kept for old clients.
+- v2.2.1: search_similar now returns the FULL payload. The old whitelist
+  (forward_return_1h only) silently dropped forward_return_4h, so the v2.2
+  brain saw 0 usable neighbours everywhere and the backtest ran 798
+  trend_fallback trades. Never whitelist payload keys again.
 """
 import uuid
 from typing import List, Dict, Optional
@@ -99,6 +96,9 @@ class QdrantMemory:
         kNN search with optional filters:
         - before_ts: only states with ts <= before_ts (look-ahead guard)
         - regime: only states from the same market regime
+
+        Returns the FULL payload per hit (plus 'score') - callers decide
+        which outcome key they need (forward_return_1h / _4h / ...).
         """
         must = []
         if symbol:
@@ -130,11 +130,9 @@ class QdrantMemory:
                 with_payload=True,
             )
 
-        return [{
-            'score': hit.score,
-            'symbol': hit.payload.get('symbol'),
-            'timestamp': hit.payload.get('timestamp'),
-            'ts': hit.payload.get('ts'),
-            'regime_label': hit.payload.get('regime_label'),
-            'forward_return_1h': hit.payload.get('forward_return_1h'),
-        } for hit in results]
+        out = []
+        for hit in results:
+            d = dict(hit.payload or {})
+            d['score'] = hit.score
+            out.append(d)
+        return out

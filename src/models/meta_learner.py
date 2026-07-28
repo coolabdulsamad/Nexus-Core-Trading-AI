@@ -1,31 +1,19 @@
 """
-src/models/meta_learner.py  (Brain v2.2)
+src/models/meta_learner.py  (Brain v2.2.1)
 ======================================
 Case-based reasoning over Qdrant memory. For the current market state it
 retrieves the k most similar HISTORICAL states and averages their realised
 forward returns at the configured prediction horizon
 (config.FORWARD_HORIZON_HOURS, default 4h).
 
-Brain v2 upgrades
------------------
-1. NO LOOK-AHEAD: only neighbours with ts <= now - (horizon + 1h) are used,
-   so every neighbour's outcome was fully known at decision time.
-2. ROBUST WEIGHTING: negative/zero cosine scores are discarded, a similarity
-   floor is applied, weights are squared-positive scores.
-3. NEIGHBOUR AGREEMENT: a signal is only valid if a weighted majority of
-   neighbours agree on the direction - kills weak/coin-flip signals.
-4. REGIME FILTER: optionally only compare against states from the same
-   market regime (trend_up / trend_down / range).
-5. SIGNAL QUALITY SCORE (0..1): conviction x agreement x similarity.
-6. SENTIMENT HONESTY: real FinBERT sentiment is a LIVE-only bias.
-7. DIRECTION ALIGNMENT (v2.1): the weighted majority must agree WITH the
-   signal direction, not just clear a strength floor.
-
-v2.2
-----
-8. PREDICTION HORIZON 1h -> 4h (config-driven): the 1h edge (~0.1%) was the
-   same size as round-trip costs (~0.16%), a structurally negative
-   expectancy. The outcome key is now forward_return_{horizon}h everywhere.
+v2.2.1
+------
+- TREND FALLBACK IS NOW ADVISORY-ONLY (quality 0.10 < MIN_SIGNAL_QUALITY).
+  The old fallback had quality 0.25 - above the 0.20 trade gate - so when
+  the brain is blind (thin memory) the system machine-gunned sma_200
+  fallback trades (798 trades, -61% in one backtest). A blind system must
+  stand down, not gamble. Set ALLOW_TREND_FALLBACK_TRADES=True in config
+  only if you explicitly want the old behaviour.
 """
 import numpy as np
 import pandas as pd
@@ -41,6 +29,7 @@ BUY_THRESHOLD = config.BUY_THRESHOLD
 SELL_THRESHOLD = config.SELL_THRESHOLD
 NEIGHBORS = config.MEMORY_NEIGHBORS
 OUTCOME_KEY = f"forward_return_{config.FORWARD_HORIZON_HOURS}h"
+ALLOW_FALLBACK_TRADES = getattr(config, 'ALLOW_TREND_FALLBACK_TRADES', False)
 
 
 class MetaLearner:
@@ -136,9 +125,7 @@ class MetaLearner:
         elif prob < SELL_THRESHOLD:
             direction = 'SELL'
 
-        # Agreement gate: agreement is weighted sign balance on [-1, 1]
-        # (0.10 = 55/45 majority). MIN_NEIGHBOR_AGREEMENT=0.55 means we
-        # require at least a 55/45 majority, i.e. |agreement| >= 0.10.
+        # Agreement gate: |agreement| >= 0.10 == at least a 55/45 majority
         min_balance = 2 * config.MIN_NEIGHBOR_AGREEMENT - 1
         if direction != 'HOLD' and abs(agreement) < min_balance:
             direction = 'HOLD'
@@ -171,7 +158,11 @@ class MetaLearner:
 
     # ------------------------------------------------------------------
     def _trend_fallback(self, symbol, row, reason='thin_memory'):
-        """Thin memory -> mild trend bias, still inside the HOLD zone logic."""
+        """
+        Thin memory -> mild trend bias. ADVISORY ONLY: quality stays below
+        MIN_SIGNAL_QUALITY unless ALLOW_TREND_FALLBACK_TRADES is set, so a
+        blind system stands down instead of gambling.
+        """
         prob = 0.5
         try:
             sma200 = row.get('sma_200')
@@ -180,6 +171,7 @@ class MetaLearner:
         except Exception:
             pass
         signal = 'BUY' if prob > BUY_THRESHOLD else ('SELL' if prob < SELL_THRESHOLD else 'HOLD')
+        quality = 0.25 if ALLOW_FALLBACK_TRADES else 0.10
         return {'symbol': symbol, 'signal': signal, 'confidence': prob,
-                'quality': 0.25, 'agreement': 0.0, 'neighbors_used': 0,
+                'quality': quality, 'agreement': 0.0, 'neighbors_used': 0,
                 'reason': f'trend_fallback ({reason})'}
