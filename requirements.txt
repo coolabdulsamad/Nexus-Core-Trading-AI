@@ -1,0 +1,12 @@
+pandas==2.2.3
+numpy==1.26.2
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+qdrant-client==1.7.0
+# TA-Lib==0.4.28
+TA-Lib>=0.4.32
+polygon-api-client==1.13.1
+python-dotenv==1.0.0
+pydantic==2.5.0
+requests==2.31.0
+python-json-logger==2.0.7

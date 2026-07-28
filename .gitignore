@@ -1,0 +1,9 @@
+venv/
+logs/
+ta-lib/
+node_modules/
+data/timescaledb/
+__pycache__/
+*.pyc
+.env
+*.log
