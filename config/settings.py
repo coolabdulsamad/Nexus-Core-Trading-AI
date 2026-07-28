@@ -61,18 +61,26 @@ class GlobalConfig:
     NOTIONAL_CAP_ABS = 75000             # absolute $ cap per position
 
     # ----- Trade structure -----
+    # v2.1: TP was 3R on a 3xATR stop = 9xATR away - unreachable inside the
+    # 48-bar (4h) time limit on 5-min bars. Backtest showed ZERO take-profit
+    # exits in 3 months: every trade died at SL / sma_cross / time_limit.
+    # Now: SL 3xATR, TP 4.5xATR (R:R 1.5), breakeven lock at 1.5xATR.
     STOP_ATR_MULT = 3.0                  # stop distance = 3 x ATR
-    REWARD_RISK_RATIO = 3.0              # TP = 3R
-    BREAKEVEN_ATR_MULTIPLE = 2.5         # move stop to entry after 2.5 x ATR profit
+    REWARD_RISK_RATIO = 1.5              # TP = 1.5R (was 3R = unreachable 9xATR)
+    BREAKEVEN_ATR_MULTIPLE = 1.5         # move stop to entry after 1.5 x ATR profit
     SLIPPAGE_BPS = 0.0005
     COMMISSION_BPS = 0.0003
     TIME_LIMIT_BARS = 48                 # full exit after N bars
     COOLDOWN_BARS = 2
 
-    # ----- SMA exit (fixed: buffered + confirmed) -----
-    SMA_EXIT_ENABLED = True
-    SMA_EXIT_BUFFER_ATR = 0.25           # price must close 0.25 x ATR beyond SMA...
-    SMA_EXIT_CONFIRM_BARS = 2            # ...for 2 consecutive bars to trigger exit
+    # ----- SMA exit (DISABLED in v2.1) -----
+    # Structurally guaranteed-loss exit: a LONG may only enter above the 200
+    # SMA, so exiting when price closes 0.25xATR BELOW it always realizes a
+    # loss (backtest: 8 trades, 0% win, -$1,449 = 37% of total loss).
+    # SL/TP + signal_flip + time_limit already cover every exit case.
+    SMA_EXIT_ENABLED = False
+    SMA_EXIT_BUFFER_ATR = 0.25           # (kept for reference if re-enabled)
+    SMA_EXIT_CONFIRM_BARS = 2
 
     # ----- Daily guards -----
     DAILY_LOSS_LIMIT_PCT = 0.05          # stop trading the symbol day after -5%

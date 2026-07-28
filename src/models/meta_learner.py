@@ -1,5 +1,5 @@
 """
-src/models/meta_learner.py  (Brain v2)
+src/models/meta_learner.py  (Brain v2.1)
 ======================================
 Case-based reasoning over Qdrant memory. For the current market state it
 retrieves the k most similar HISTORICAL states and averages their realised
@@ -9,19 +9,21 @@ Brain v2 upgrades
 -----------------
 1. NO LOOK-AHEAD: only neighbours with ts <= (now - MEMORY_MIN_AGE_MINUTES)
    are used, so every neighbour's outcome was fully known at decision time.
-   The current bar can never retrieve itself or the future.
 2. ROBUST WEIGHTING: negative/zero cosine scores are discarded, a similarity
-   floor is applied, weights are squared-positive scores (no sign flips, no
-   division blow-ups).
+   floor is applied, weights are squared-positive scores.
 3. NEIGHBOUR AGREEMENT: a signal is only valid if a weighted majority of
    neighbours agree on the direction - kills weak/coin-flip signals.
 4. REGIME FILTER: optionally only compare against states from the same
    market regime (trend_up / trend_down / range).
 5. SIGNAL QUALITY SCORE (0..1): conviction x agreement x similarity.
-   Used by RiskGate for signal-strength position sizing.
-6. SENTIMENT HONESTY: real FinBERT sentiment is a LIVE-only bias. In
-   backtests it is off by default (SENTIMENT_IN_BACKTEST=False); the old
-   MD5 "synthetic sentiment" noise channel is gone.
+6. SENTIMENT HONESTY: real FinBERT sentiment is a LIVE-only bias.
+
+v2.1
+----
+7. DIRECTION ALIGNMENT: the old agreement gate only checked |agreement|,
+   so a SELL could pass while the weighted majority of neighbours had
+   POSITIVE outcomes (contradictory evidence). Now the majority must
+   agree with the signal direction, not just exist.
 """
 import numpy as np
 import pandas as pd
@@ -124,7 +126,7 @@ class MetaLearner:
         if mode == 'live':
             prob = float(np.clip(prob + sentiment * config.SENTIMENT_BIAS, 0.0, 1.0))
 
-        # ---- 6. Decision with HOLD zone + agreement gate ----
+        # ---- 6. Decision with HOLD zone + agreement gates ----
         direction = 'HOLD'
         if prob > BUY_THRESHOLD:
             direction = 'BUY'
@@ -136,6 +138,14 @@ class MetaLearner:
         # require at least a 55/45 majority, i.e. |agreement| >= 0.10.
         min_balance = 2 * config.MIN_NEIGHBOR_AGREEMENT - 1
         if direction != 'HOLD' and abs(agreement) < min_balance:
+            direction = 'HOLD'
+
+        # v2.1 direction alignment: the weighted majority must agree WITH
+        # the signal. (Old code: a SELL could pass with mostly-positive
+        # neighbour outcomes as long as |agreement| cleared the floor.)
+        if direction == 'BUY' and agreement <= 0:
+            direction = 'HOLD'
+        elif direction == 'SELL' and agreement >= 0:
             direction = 'HOLD'
 
         quality = self._quality_score(prob, agreement, sim_avg)

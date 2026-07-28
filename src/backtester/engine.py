@@ -1,13 +1,16 @@
 """
-src/backtester/engine.py  (v2)
+src/backtester/engine.py  (v2.1)
 Honest backtesting:
 - MetaLearner runs in mode='backtest' -> memory search is time-filtered,
   no look-ahead, no future sentiment.
-- Conviction gate |prob-0.5| works for BOTH longs and shorts (the old
-  confidence>=X gate made strong shorts impossible).
+- Conviction gate |prob-0.5| works for BOTH longs and shorts.
 - Signal QUALITY gates entry and drives position size tier.
 - SL/TP detection uses bar high/low with fills at stop/limit prices.
-- SMA exit is buffered + confirmed (config), labels are correct.
+- v2.1: breakeven stop rule is actually APPLIED every bar (it was
+  configured but never called in v2, so winners never got locked).
+- v2.1: sma_cross exit disabled by config (structurally guaranteed-loss:
+  entries require price beyond the 200 SMA, exits fire beyond it in the
+  losing direction).
 """
 import psycopg2
 import pandas as pd
@@ -62,7 +65,7 @@ class BacktesterEngine:
 
     # ------------------------------------------------------------------
     def _sma_exit_confirmed(self, idx, direction) -> bool:
-        """Buffered + confirmed SMA cross exit."""
+        """Buffered + confirmed SMA cross exit (disabled by config in v2.1)."""
         if not config.SMA_EXIT_ENABLED:
             return False
         need = config.SMA_EXIT_CONFIRM_BARS
@@ -106,6 +109,10 @@ class BacktesterEngine:
                 if last.get('_counted') is not True:
                     self.risk.record_realized_pnl(last['pnl'])
                     last['_counted'] = True
+
+            # 2b. Breakeven stop lock (v2.1: was configured but never applied)
+            for pos in self.broker.open_positions:
+                self.risk.update_breakeven_stop(pos, price, atr)
 
             # 3. AI signal (point-in-time)
             result = self.meta_learner.get_signal(self.symbol, row, timestamp=t, mode='backtest')
@@ -212,7 +219,6 @@ class BacktesterEngine:
             avg_l = np.mean([t['pnl'] for t in losses]) if losses else 0
             pf = abs(sum(t['pnl'] for t in wins) / sum(t['pnl'] for t in losses)) if losses and sum(t['pnl'] for t in losses) != 0 else float('inf')
             print(f"Avg win: ${avg_w:,.2f}   Avg loss: ${avg_l:,.2f}   Profit factor: {pf:.2f}")
-            # Exit-reason breakdown (this is where sma_cross gets exposed)
             print("-" * 60)
             print("EXIT REASON BREAKDOWN:")
             reasons = {}
