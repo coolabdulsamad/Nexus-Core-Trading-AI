@@ -1,11 +1,29 @@
+# Core data / math
 pandas==2.2.3
 numpy==1.26.2
+
+# Databases
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
 qdrant-client==1.7.0
-# TA-Lib==0.4.28
+
+# Technical analysis (C library - see README for install)
 TA-Lib>=0.4.32
+
+# ML (brain: scaler + PCA + model persistence)
+scikit-learn>=1.4
+joblib>=1.3
+
+# Market data + broker
 polygon-api-client==1.13.1
+alpaca-py>=0.30
+yfinance>=0.2.40
+
+# News sentiment (heavy - only needed when USE_REAL_SENTIMENT=True)
+torch>=2.2
+transformers>=4.40
+
+# Utils
 python-dotenv==1.0.0
 pydantic==2.5.0
 requests==2.31.0

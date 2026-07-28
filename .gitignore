@@ -3,7 +3,9 @@ logs/
 ta-lib/
 node_modules/
 data/timescaledb/
+data/qdrant_storage/
 __pycache__/
 *.pyc
 .env
 *.log
+models/saved/
