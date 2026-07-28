@@ -7,7 +7,7 @@ import torch
 import numpy as np
 from transformers import BertTokenizer, BertForSequenceClassification
 from typing import List
-from utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger("SentimentAnalyzer", "logs/news.log")
 
@@ -15,7 +15,7 @@ class SentimentAnalyzer:
     def __init__(self):
         self.model_name = "yiyanghkust/finbert-tone"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+
         logger.info(f"Loading FinBERT on {self.device}...")
         # Force slow tokenizer and explicit model class
         self.tokenizer = BertTokenizer.from_pretrained(self.model_name)
@@ -43,7 +43,7 @@ class SentimentAnalyzer:
             outputs = self.model(**inputs)
             logits = outputs.logits
             probabilities = torch.softmax(logits, dim=1)
-            
+
             # FinBERT outputs: [Negative, Neutral, Positive]
             neg_score = probabilities[0][0].item()
             neu_score = probabilities[0][1].item()
@@ -61,10 +61,10 @@ class SentimentAnalyzer:
     def get_aggregate_sentiment(self, headlines: List[str]) -> float:
         if not headlines:
             return 0.0
-        
+
         scores = self.analyze_batch(headlines)
         avg_score = np.mean(scores)
         avg_score = max(-1.0, min(1.0, avg_score))
-        
+
         logger.info(f"Aggregate sentiment score: {avg_score:.4f} based on {len(headlines)} headlines.")
         return round(avg_score, 4)

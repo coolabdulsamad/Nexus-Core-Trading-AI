@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Dict
 from config.settings import config
-from utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger("NewsScraper", "logs/news.log")
 
@@ -62,7 +62,7 @@ class NewsScraper:
         """Fetches headlines for all symbols in the config."""
         if symbols is None:
             symbols = config.symbols
-        
+
         results = {}
         for sym in symbols:
             results[sym] = self.fetch_headlines(sym, days_back=1)
