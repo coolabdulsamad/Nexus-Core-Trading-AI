@@ -1,14 +1,15 @@
 """
-src/models/meta_learner.py  (Brain v2.1)
+src/models/meta_learner.py  (Brain v2.2)
 ======================================
 Case-based reasoning over Qdrant memory. For the current market state it
 retrieves the k most similar HISTORICAL states and averages their realised
-1-hour forward returns.
+forward returns at the configured prediction horizon
+(config.FORWARD_HORIZON_HOURS, default 4h).
 
 Brain v2 upgrades
 -----------------
-1. NO LOOK-AHEAD: only neighbours with ts <= (now - MEMORY_MIN_AGE_MINUTES)
-   are used, so every neighbour's outcome was fully known at decision time.
+1. NO LOOK-AHEAD: only neighbours with ts <= now - (horizon + 1h) are used,
+   so every neighbour's outcome was fully known at decision time.
 2. ROBUST WEIGHTING: negative/zero cosine scores are discarded, a similarity
    floor is applied, weights are squared-positive scores.
 3. NEIGHBOUR AGREEMENT: a signal is only valid if a weighted majority of
@@ -17,13 +18,14 @@ Brain v2 upgrades
    market regime (trend_up / trend_down / range).
 5. SIGNAL QUALITY SCORE (0..1): conviction x agreement x similarity.
 6. SENTIMENT HONESTY: real FinBERT sentiment is a LIVE-only bias.
+7. DIRECTION ALIGNMENT (v2.1): the weighted majority must agree WITH the
+   signal direction, not just clear a strength floor.
 
-v2.1
+v2.2
 ----
-7. DIRECTION ALIGNMENT: the old agreement gate only checked |agreement|,
-   so a SELL could pass while the weighted majority of neighbours had
-   POSITIVE outcomes (contradictory evidence). Now the majority must
-   agree with the signal direction, not just exist.
+8. PREDICTION HORIZON 1h -> 4h (config-driven): the 1h edge (~0.1%) was the
+   same size as round-trip costs (~0.16%), a structurally negative
+   expectancy. The outcome key is now forward_return_{horizon}h everywhere.
 """
 import numpy as np
 import pandas as pd
@@ -38,6 +40,7 @@ logger = setup_logger("MetaLearner", "logs/meta_learner.log")
 BUY_THRESHOLD = config.BUY_THRESHOLD
 SELL_THRESHOLD = config.SELL_THRESHOLD
 NEIGHBORS = config.MEMORY_NEIGHBORS
+OUTCOME_KEY = f"forward_return_{config.FORWARD_HORIZON_HOURS}h"
 
 
 class MetaLearner:
@@ -104,7 +107,7 @@ class MetaLearner:
 
         # ---- 4. Filter neighbours: usable outcomes + similarity floor ----
         usable = [h for h in hits
-                  if h.get('forward_return_1h') is not None
+                  if h.get(OUTCOME_KEY) is not None
                   and h['score'] >= config.MIN_NEIGHBOR_SIMILARITY]
 
         if len(usable) < 5:
@@ -113,7 +116,7 @@ class MetaLearner:
 
         # ---- 5. Robust weighting (positive squared scores) ----
         scores = np.array([max(h['score'], 0.0) for h in usable]) ** 2
-        rets = np.array([h['forward_return_1h'] for h in usable], dtype=float)
+        rets = np.array([h[OUTCOME_KEY] for h in usable], dtype=float)
         weights = scores / scores.sum()
 
         wmean = float(np.sum(rets * weights))
@@ -140,9 +143,8 @@ class MetaLearner:
         if direction != 'HOLD' and abs(agreement) < min_balance:
             direction = 'HOLD'
 
-        # v2.1 direction alignment: the weighted majority must agree WITH
-        # the signal. (Old code: a SELL could pass with mostly-positive
-        # neighbour outcomes as long as |agreement| cleared the floor.)
+        # Direction alignment: the weighted majority must agree WITH the
+        # signal (a SELL backed by mostly-positive outcomes is contradictory).
         if direction == 'BUY' and agreement <= 0:
             direction = 'HOLD'
         elif direction == 'SELL' and agreement >= 0:

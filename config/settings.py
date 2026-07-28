@@ -33,8 +33,11 @@ class GlobalConfig:
     BAR_MINUTES = 5                      # bar size used everywhere
 
     # ----- Brain (case-based memory) -----
+    FORWARD_HORIZON_HOURS = 4            # prediction target: realised return N hours ahead
     MEMORY_NEIGHBORS = 100               # k nearest states to retrieve
-    MEMORY_MIN_AGE_MINUTES = 60          # neighbor must be >= this old (its 1h outcome fully known) -> kills look-ahead
+    # Neighbor must be older than the horizon (+1h buffer) so its outcome
+    # was fully known at decision time -> kills look-ahead.
+    MEMORY_MIN_AGE_MINUTES = (FORWARD_HORIZON_HOURS + 1) * 60
     MIN_NEIGHBOR_SIMILARITY = 0.50       # cosine floor; neighbors below this are ignored
     MIN_NEIGHBOR_AGREEMENT = 0.55        # weighted fraction of neighbors agreeing on direction (0.5 = coin flip)
     REGIME_FILTER_ENABLED = True         # prefer neighbors from the same market regime
@@ -62,22 +65,22 @@ class GlobalConfig:
 
     # ----- Trade structure -----
     # v2.1: TP was 3R on a 3xATR stop = 9xATR away - unreachable inside the
-    # 48-bar (4h) time limit on 5-min bars. Backtest showed ZERO take-profit
-    # exits in 3 months: every trade died at SL / sma_cross / time_limit.
-    # Now: SL 3xATR, TP 4.5xATR (R:R 1.5), breakeven lock at 1.5xATR.
+    # time limit on 5-min bars. Now: SL 3xATR, TP 4.5xATR (R:R 1.5),
+    # breakeven lock at 1.5xATR.
+    # v2.2: with a 4h prediction horizon the time limit doubles to 96 bars
+    # (8h = 2x horizon) so trades can actually reach the 4.5xATR target.
     STOP_ATR_MULT = 3.0                  # stop distance = 3 x ATR
-    REWARD_RISK_RATIO = 1.5              # TP = 1.5R (was 3R = unreachable 9xATR)
+    REWARD_RISK_RATIO = 1.5              # TP = 1.5R
     BREAKEVEN_ATR_MULTIPLE = 1.5         # move stop to entry after 1.5 x ATR profit
     SLIPPAGE_BPS = 0.0005
     COMMISSION_BPS = 0.0003
-    TIME_LIMIT_BARS = 48                 # full exit after N bars
+    TIME_LIMIT_BARS = 96                 # full exit after N bars (96 = 8h = 2x horizon)
     COOLDOWN_BARS = 2
 
     # ----- SMA exit (DISABLED in v2.1) -----
     # Structurally guaranteed-loss exit: a LONG may only enter above the 200
     # SMA, so exiting when price closes 0.25xATR BELOW it always realizes a
-    # loss (backtest: 8 trades, 0% win, -$1,449 = 37% of total loss).
-    # SL/TP + signal_flip + time_limit already cover every exit case.
+    # loss. SL/TP + signal_flip + time_limit already cover every exit case.
     SMA_EXIT_ENABLED = False
     SMA_EXIT_BUFFER_ATR = 0.25           # (kept for reference if re-enabled)
     SMA_EXIT_CONFIRM_BARS = 2
