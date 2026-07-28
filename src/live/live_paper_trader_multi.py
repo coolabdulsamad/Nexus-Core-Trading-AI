@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-src/live/live_paper_trader_multi.py  (v2)
-Multi-symbol Alpaca paper trader.
+src/live/live_paper_trader_multi.py  (v3)
+Multi-symbol Alpaca paper trader - universe-driven + crypto.
 
-v2 upgrades
------------
-- Signal QUALITY gate + signal-strength position sizing (strong -> bigger).
-- DAILY PROFIT TARGET: reach it -> stop opening trades, lock open positions
-  to breakeven, notify. (Avoids giving a good day back.)
-- sma_cross exit FIXED: buffered (0.25xATR) + confirmed (2 consecutive bars);
-  no more mixing with the AI signal hysteresis bug.
-- DATA FRESHNESS: trades only on bars < MAX_DATA_AGE_SECONDS old (default
-  10 min, was silently tolerating 2h). Lag is measured and reported.
-- Honest conviction gate for shorts (parity with backtester).
-- Full Telegram coverage: entries, exits, partials, guards, heartbeat
-  capital updates, END-OF-DAY analysis report.
+v3 upgrades (on top of v2)
+--------------------------
+- UNIVERSE: symbols come from the DB-backed SymbolManager (not hardcoded).
+  mode 'manual' = all active symbols; mode 'auto' = the DailySelector picks
+  the top-N most favourable symbols each morning (score persisted with
+  reasons). Symbols with open positions stay managed until flat.
+- CRYPTO: BTC/USD & co. trade 24/7 with fractional quantities and GTC
+  orders; data via Alpaca crypto feed; stocks keep market-hours gating.
+- Everything from v2 kept: quality gate, tier sizing, daily profit target,
+  buffered sma_cross, freshness guard, Telegram EOD report.
 """
 import os
-import sys
 import time
-import requests
 import concurrent.futures
 from datetime import datetime, timedelta
 import pandas as pd
@@ -28,8 +24,8 @@ from requests.exceptions import ConnectionError, Timeout
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.common.exceptions import APIError
 
@@ -37,6 +33,7 @@ from config.settings import config
 from src.models.meta_learner import MetaLearner
 from src.backtester.risk_gate import RiskGate
 from src.ingestion.indicator_calculator import calculate_all_indicators
+from src.universe.symbol_manager import SymbolManager
 from src.utils.logger import setup_logger
 from src.utils.telegram import send_telegram
 from src.utils import reporter
@@ -68,24 +65,36 @@ def _new_position(pos_type, entry_price, size, sl, tp, entry_time, atr):
 
 class LiveTraderMulti:
     def __init__(self, symbols=None, initial_capital=100000):
-        self.symbols = symbols or list(config.symbols)
-        self.initial_capital = initial_capital
-        self.capital_per_symbol = initial_capital / len(self.symbols)
-
+        self.mgr = SymbolManager()
         self.meta_learner = MetaLearner()
         self.trading_client = TradingClient(
             api_key=os.getenv("ALPACA_API_KEY"),
-            secret_key=os.getenv("ALPACA_SECRET_KEY"),
-            paper=True)
+            secret_key=os.getenv("ALPACA_SECRET_KEY"), paper=True)
         self.data_client = StockHistoricalDataClient(
-            api_key=os.getenv("ALPACA_API_KEY"),
-            secret_key=os.getenv("ALPACA_SECRET_KEY"))
+            api_key=os.getenv("ALPACA_API_KEY"), secret_key=os.getenv("ALPACA_SECRET_KEY"))
+        self.crypto_client = CryptoHistoricalDataClient(
+            api_key=os.getenv("ALPACA_API_KEY"), secret_key=os.getenv("ALPACA_SECRET_KEY"))
 
+        # ---- Universe ----
+        self.selector = None
+        if config.UNIVERSE_MODE == 'auto':
+            try:
+                from src.universe.selector import DailySelector
+                self.selector = DailySelector()
+            except Exception as e:
+                logger.error(f"Selector unavailable ({e}) - falling back to manual universe")
+
+        self.initial_capital = initial_capital
+        self.symbols = symbols or self._resolve_universe()
+        if not self.symbols:
+            self.symbols = list(config.symbols)
+        logger.info(f"Trading universe ({config.UNIVERSE_MODE}): {self.symbols}")
+
+        self.capital_per_symbol = initial_capital / max(1, len(self.symbols))
         self.risk_gates = {s: RiskGate(self.capital_per_symbol) for s in self.symbols}
         self.positions = {s: None for s in self.symbols}
         self.cooldown = {s: 0 for s in self.symbols}
         self.pending_exit = {s: False for s in self.symbols}
-        self.exit_reason = {s: "" for s in self.symbols}
         self.stale_alerted = {s: False for s in self.symbols}
         self.running = True
         self.cycle_count = 0
@@ -95,15 +104,58 @@ class LiveTraderMulti:
 
         self.day_start_equity = self.get_current_equity()
         self.peak_equity = self.day_start_equity
-
-        # Trade journal (feeds the EOD report + frontend)
         self.journal = []
         self.day_trades = []
 
-        logger.info("Startup: cancelling leftover orders and reconciling...")
         for sym in self.symbols:
             self.cancel_open_orders(sym)
         self.reconcile_all_positions()
+
+    # ------------------------------------------------------------------
+    # Universe
+    # ------------------------------------------------------------------
+    def _resolve_universe(self):
+        if self.selector is not None:
+            try:
+                selected = self.selector.select(top_n=config.TOP_N_SYMBOLS)
+                return [r['symbol'] for r in selected]
+            except Exception as e:
+                logger.error(f"Auto selection failed: {e} - using active symbols")
+        return self.mgr.get_active()
+
+    @staticmethod
+    def _is_crypto(symbol: str) -> bool:
+        return '/' in symbol
+
+    @staticmethod
+    def _pos_key(symbol: str) -> str:
+        """Alpaca position endpoint wants BTCUSD, orders want BTC/USD."""
+        return symbol.replace('/', '')
+
+    def _refresh_universe_if_needed(self):
+        """Auto mode: re-select each new day; keep managing open positions."""
+        if self.selector is None:
+            return
+        today = datetime.now().date()
+        if self.last_date is not None and today == self.last_date:
+            return
+        try:
+            selected = self.selector.select(top_n=config.TOP_N_SYMBOLS)
+            new_syms = [r['symbol'] for r in selected]
+            open_syms = [s for s, p in self.positions.items() if p is not None]
+            merged = list(dict.fromkeys(new_syms + open_syms))
+            for s in merged:
+                if s not in self.positions:
+                    self.positions[s] = None
+                    self.cooldown[s] = 0
+                    self.pending_exit[s] = False
+                    self.stale_alerted[s] = False
+                    self.risk_gates[s] = RiskGate(self.initial_capital / max(1, len(merged)))
+            self.symbols = merged
+            send_telegram("📋 Today's selection: " + ", ".join(
+                f"{r['symbol']}({r['score']:.2f})" for r in selected), kind='brain')
+        except Exception as e:
+            logger.error(f"Universe refresh failed: {e}")
 
     # ------------------------------------------------------------------
     # API helpers
@@ -125,7 +177,7 @@ class LiveTraderMulti:
             return float(self._retry_call(self.trading_client.get_account).equity)
         except Exception as e:
             logger.error(f"get_account failed: {e}")
-            return sum(self.risk_gates[s].capital for s in self.symbols)
+            return sum(self.risk_gates[s].capital for s in self.risk_gates)
 
     def get_account_buying_power(self):
         try:
@@ -135,7 +187,7 @@ class LiveTraderMulti:
 
     def get_position(self, symbol):
         try:
-            return self._retry_call(self.trading_client.get_position, symbol)
+            return self._retry_call(self.trading_client.get_position, self._pos_key(symbol))
         except APIError as e:
             if "position does not exist" in str(e):
                 return None
@@ -157,7 +209,7 @@ class LiveTraderMulti:
             if not orders:
                 return
             for order in orders:
-                if order.symbol != symbol:
+                if order.symbol not in (symbol, self._pos_key(symbol)):
                     continue
                 try:
                     self._retry_call(self.trading_client.cancel_order_by_id, order.id)
@@ -171,62 +223,82 @@ class LiveTraderMulti:
         return self._retry_call(self.trading_client.submit_order, order)
 
     # ------------------------------------------------------------------
-    # Data - closed 5-min bars only, with freshness measurement
+    # Data
     # ------------------------------------------------------------------
+    @staticmethod
+    def _resample_5min(df):
+        df = df.set_index('timestamp').resample('5min').agg({
+            'open': 'first', 'high': 'max', 'low': 'min',
+            'close': 'last', 'volume': 'sum'}).dropna().reset_index()
+        if not df.empty:
+            last_time = df.iloc[-1]['timestamp']
+            if pd.Timestamp.now(tz='UTC') - last_time < pd.Timedelta(minutes=5):
+                df = df.iloc[:-1]
+        return df
+
     def get_bars_for_symbol(self, symbol):
         end = datetime.now()
         start = end - timedelta(days=7)
-
-        def _fetch_alpaca():
-            for feed in ('sip', 'iex'):
-                try:
-                    req = StockBarsRequest(
-                        symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute,
-                        start=start, end=end, limit=10000, feed=feed)
-                    bars = self._retry_call(self.data_client.get_stock_bars, req).data
-                    if symbol in bars and len(bars[symbol]) > 0:
-                        df = pd.DataFrame([{
-                            'timestamp': b.timestamp, 'open': b.open, 'high': b.high,
-                            'low': b.low, 'close': b.close, 'volume': b.volume,
-                        } for b in bars[symbol]]).sort_values('timestamp').reset_index(drop=True)
-                        df = df.set_index('timestamp').resample('5min').agg({
-                            'open': 'first', 'high': 'max', 'low': 'min',
-                            'close': 'last', 'volume': 'sum'}).dropna().reset_index()
-                        if not df.empty:
-                            last_time = df.iloc[-1]['timestamp']
-                            if pd.Timestamp.now(tz='UTC') - last_time < pd.Timedelta(minutes=5):
-                                df = df.iloc[:-1]          # drop still-open bar
-                        return df
-                except Exception as e:
-                    logger.warning(f"{symbol}: feed {feed} failed: {e}")
-            return pd.DataFrame()
-
-        df = pd.DataFrame()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            try:
-                df = ex.submit(_fetch_alpaca).result(timeout=config.DATA_FETCH_TIMEOUT)
-            except Exception as e:
-                logger.error(f"{symbol}: Alpaca fetch error: {e}")
-
         source = 'alpaca'
-        if df.empty and USE_YAHOO_FALLBACK and yf is not None:
+
+        if self._is_crypto(symbol):
+            df = pd.DataFrame()
             try:
-                source = 'yahoo'
-                ydf = yf.Ticker(symbol).history(period="5d", interval="5m")
-                if not ydf.empty:
-                    ydf = ydf.reset_index()
-                    ydf['timestamp'] = ydf['Datetime'].dt.tz_convert('UTC')
-                    df = ydf.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low',
-                                             'Close': 'close', 'Volume': 'volume'})[
-                        ['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                req = CryptoBarsRequest(symbol_or_symbols=[symbol],
+                                        timeframe=TimeFrame.Minute,
+                                        start=start, end=end, limit=10000)
+                bars = self._retry_call(self.crypto_client.get_crypto_bars, req).data
+                if symbol in bars and len(bars[symbol]) > 0:
+                    df = pd.DataFrame([{
+                        'timestamp': b.timestamp, 'open': b.open, 'high': b.high,
+                        'low': b.low, 'close': b.close, 'volume': b.volume,
+                    } for b in bars[symbol]]).sort_values('timestamp').reset_index(drop=True)
+                    df = self._resample_5min(df)
+                    source = 'alpaca-crypto'
             except Exception as e:
-                logger.error(f"{symbol}: Yahoo fallback failed: {e}")
+                logger.error(f"{symbol}: crypto fetch failed: {e}")
+        else:
+            def _fetch_alpaca():
+                for feed in ('sip', 'iex'):
+                    try:
+                        req = StockBarsRequest(symbol_or_symbols=[symbol],
+                                               timeframe=TimeFrame.Minute,
+                                               start=start, end=end, limit=10000, feed=feed)
+                        bars = self._retry_call(self.data_client.get_stock_bars, req).data
+                        if symbol in bars and len(bars[symbol]) > 0:
+                            df = pd.DataFrame([{
+                                'timestamp': b.timestamp, 'open': b.open, 'high': b.high,
+                                'low': b.low, 'close': b.close, 'volume': b.volume,
+                            } for b in bars[symbol]]).sort_values('timestamp').reset_index(drop=True)
+                            return self._resample_5min(df)
+                    except Exception as e:
+                        logger.warning(f"{symbol}: feed {feed} failed: {e}")
+                return pd.DataFrame()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                try:
+                    df = ex.submit(_fetch_alpaca).result(timeout=config.DATA_FETCH_TIMEOUT)
+                except Exception as e:
+                    logger.error(f"{symbol}: Alpaca fetch error: {e}")
+                    df = pd.DataFrame()
+
+            if df.empty and USE_YAHOO_FALLBACK and yf is not None:
+                try:
+                    source = 'yahoo'
+                    ydf = yf.Ticker(symbol).history(period="5d", interval="5m")
+                    if not ydf.empty:
+                        ydf = ydf.reset_index()
+                        ydf['timestamp'] = ydf['Datetime'].dt.tz_convert('UTC')
+                        df = ydf.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low',
+                                                 'Close': 'close', 'Volume': 'volume'})[
+                            ['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                except Exception as e:
+                    logger.error(f"{symbol}: Yahoo fallback failed: {e}")
 
         if df.empty:
             return df, source, None
-
         lag = (pd.Timestamp.now(tz='UTC') - df.iloc[-1]['timestamp']).total_seconds()
-        logger.info(f"{symbol}: {len(df)} bars ({source}), latest={df.iloc[-1]['timestamp']}, lag={lag/60:.1f} min")
+        logger.info(f"{symbol}: {len(df)} bars ({source}), lag={lag/60:.1f} min")
         return df, source, lag
 
     def is_market_open(self):
@@ -239,18 +311,17 @@ class LiveTraderMulti:
     # Reconciliation
     # ------------------------------------------------------------------
     def reconcile_all_positions(self):
-        for sym in self.symbols:
+        for sym in list(self.symbols):
             broker_pos = self.get_position(sym)
             if broker_pos is None:
-                if self.positions[sym] is not None:
-                    logger.info(f"{sym}: closed externally - clearing local state.")
+                if self.positions.get(sym) is not None:
                     self.positions[sym] = None
                     self.pending_exit[sym] = False
                 continue
             side = self.side_str(broker_pos)
             qty = abs(float(broker_pos.qty))
             entry = float(broker_pos.avg_entry_price)
-            if self.positions[sym] is None:
+            if self.positions.get(sym) is None:
                 self.positions[sym] = _new_position(
                     'LONG' if side == 'long' else 'SHORT',
                     entry, qty, 0.0, 0.0, pd.Timestamp.now(tz='UTC'), None)
@@ -264,13 +335,14 @@ class LiveTraderMulti:
             return
         if today != self.last_date:
             logger.info(f"New day ({today}) - full resync.")
-            self.reconcile_all_positions()
             self.last_date = today
             self.day_trades = []
             self.day_start_equity = self.get_current_equity()
             self.daily_target_announced = False
             for g in self.risk_gates.values():
                 g.profit_target_hit = False
+            self._refresh_universe_if_needed()
+            self.reconcile_all_positions()
 
     def log_trade(self, trade_data):
         self.journal.append(trade_data)
@@ -305,7 +377,7 @@ class LiveTraderMulti:
         logger.info(f"{symbol}: flatten {side} x{live_qty} ({reason})")
 
         try:
-            self._retry_call(self.trading_client.close_position, symbol)
+            self._retry_call(self.trading_client.close_position, self._pos_key(symbol))
             self.pending_exit[symbol] = True
         except Exception as e:
             logger.error(f"{symbol}: close_position failed: {e} - market order fallback")
@@ -319,7 +391,8 @@ class LiveTraderMulti:
             self.log_trade({'symbol': symbol, 'side': side, 'qty': live_qty,
                             'entry': entry, 'exit': current_price, 'pnl': pnl,
                             'reason': reason, 'exit_time': str(current_time)})
-            self.risk_gates[symbol].record_realized_pnl(pnl)
+            if symbol in self.risk_gates:
+                self.risk_gates[symbol].record_realized_pnl(pnl)
             send_telegram(
                 f"EXIT {symbol} ({reason})\nSide: {side.upper()} x{live_qty}\n"
                 f"Entry ${entry:.2f} -> Exit ${current_price:.2f}\nPnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)",
@@ -330,11 +403,14 @@ class LiveTraderMulti:
         else:
             send_telegram(f"{symbol}: exit pending, still open after {ORDER_POLL_TIMEOUT}s", kind='warning')
 
+    def _order_tif(self, symbol):
+        return TimeInForce.GTC if self._is_crypto(symbol) else TimeInForce.DAY
+
     def _close_with_market_order(self, symbol, qty, side):
         order_side = OrderSide.SELL if side == 'long' else OrderSide.BUY
         try:
             order = MarketOrderRequest(symbol=symbol, qty=qty, side=order_side,
-                                       time_in_force=TimeInForce.DAY)
+                                       time_in_force=self._order_tif(symbol))
             submitted = self.submit_order_with_retry(order)
             if submitted and hasattr(submitted, 'id'):
                 if self._poll_position_closed(symbol):
@@ -348,7 +424,10 @@ class LiveTraderMulti:
         self.pending_exit[symbol] = False
 
     def _close_partial(self, symbol, qty, price, reason):
-        qty = int(round(qty))
+        if self._is_crypto(symbol):
+            qty = round(qty, 6)
+        else:
+            qty = int(round(qty))
         if qty <= 0:
             return
         broker_pos = self.get_position(symbol)
@@ -362,7 +441,7 @@ class LiveTraderMulti:
         order_side = OrderSide.SELL if side == 'long' else OrderSide.BUY
         try:
             order = MarketOrderRequest(symbol=symbol, qty=qty, side=order_side,
-                                       time_in_force=TimeInForce.DAY)
+                                       time_in_force=self._order_tif(symbol))
             submitted = self.submit_order_with_retry(order)
             if submitted and hasattr(submitted, 'id'):
                 send_telegram(f"PARTIAL EXIT {symbol} ({reason}): {qty} @ ${price:.2f}", kind='partial')
@@ -408,14 +487,14 @@ class LiveTraderMulti:
     def process_symbol(self, symbol):
         self.daily_resync_if_needed()
 
-        if self.pending_exit[symbol]:
+        if self.pending_exit.get(symbol):
             if self.get_position(symbol) is None:
                 self.pending_exit[symbol] = False
                 self.positions[symbol] = None
                 self.cooldown[symbol] = config.COOLDOWN_BARS
             return
 
-        if self.cooldown[symbol] > 0:
+        if self.cooldown.get(symbol, 0) > 0:
             self.cooldown[symbol] -= 1
             return
 
@@ -426,13 +505,12 @@ class LiveTraderMulti:
             logger.warning(f"{symbol}: no data")
             return
 
-        # --- DATA FRESHNESS GUARD (was silently tolerating 2h-old bars) ---
         if lag is not None and lag > config.MAX_DATA_AGE_SECONDS:
             logger.critical(f"{symbol}: STALE data ({lag/60:.1f} min old) - not trading")
-            if not self.stale_alerted[symbol]:
+            if not self.stale_alerted.get(symbol):
                 self.stale_alerted[symbol] = True
                 send_telegram(f"{symbol}: market data stale ({lag/60:.0f} min, source={source}). "
-                              f"Trading paused for this symbol until fresh.", kind='warning')
+                              f"Trading paused until fresh.", kind='warning')
             return
         self.stale_alerted[symbol] = False
 
@@ -450,12 +528,12 @@ class LiveTraderMulti:
         drawdown = (self.peak_equity - equity) / self.peak_equity if self.peak_equity else 0
         if drawdown >= config.MAX_DRAWDOWN_PCT:
             send_telegram(f"MAX DRAWDOWN {drawdown:.2%} - flattening everything.", kind='critical')
-            for sym in self.symbols:
+            for sym in list(self.symbols):
                 self.flatten_symbol(sym, price, t, reason="max_drawdown")
             return
 
-        gate = self.risk_gates[symbol]
-        gate.capital = equity / len(self.symbols)
+        gate = self.risk_gates.setdefault(symbol, RiskGate(equity / max(1, len(self.symbols))))
+        gate.capital = equity / max(1, len(self.symbols))
         gate.reset_daily_if_new_day(t)
         if not gate.check_daily_loss_limit(equity):
             logger.warning(f"{symbol}: daily loss limit - flattening.")
@@ -464,12 +542,11 @@ class LiveTraderMulti:
 
         daily_target_hit = self._check_daily_profit_target(equity)
 
-        # --- Brain signal (live mode) ---
         result = self.meta_learner.get_signal(symbol, row, timestamp=t, mode='live')
         signal, prob = result['signal'], result['confidence']
         quality = result.get('quality', 0.0)
         conviction = abs(prob - 0.5)
-        logger.info(f"{symbol} | {signal} prob={prob:.4f} q={quality:.3f} conv={conviction:.4f} | {result.get('reason','')}")
+        logger.info(f"{symbol} | {signal} prob={prob:.4f} q={quality:.3f} | {result.get('reason','')}")
 
         vol_ok = (atr >= config.MIN_ATR_THRESHOLD) if config.VOLATILITY_FILTER_ENABLED else True
         conviction_ok = conviction >= config.ENTRY_CONVICTION_MARGIN
@@ -492,7 +569,7 @@ class LiveTraderMulti:
                 return
 
             size, sl, tp, tier = gate.size_with_tier(price, atr, quality, direction)
-            qty = int(round(size))
+            qty = round(size, 6) if self._is_crypto(symbol) else int(round(size))
             if qty <= 0:
                 return
             if qty * price > self.get_account_buying_power():
@@ -502,13 +579,13 @@ class LiveTraderMulti:
             side = OrderSide.BUY if direction == 'LONG' else OrderSide.SELL
             try:
                 order = MarketOrderRequest(symbol=symbol, qty=qty, side=side,
-                                           time_in_force=TimeInForce.DAY)
+                                           time_in_force=self._order_tif(symbol))
                 submitted = self.submit_order_with_retry(order)
                 if submitted and hasattr(submitted, 'id'):
                     self.positions[symbol] = _new_position(direction, price, qty, sl, tp, t, atr)
                     send_telegram(
                         f"{direction} ENTRY {symbol} [{tier} signal q={quality:.2f}]\n"
-                        f"{qty} shares @ ${price:.2f}\nSL ${sl:.2f} | TP ${tp:.2f}\n"
+                        f"{qty} @ ${price:.2f}\nSL ${sl:.2f} | TP ${tp:.2f}\n"
                         f"{result.get('reason','')}", kind='entry')
             except Exception as e:
                 logger.error(f"{symbol}: entry order failed: {e}")
@@ -534,33 +611,28 @@ class LiveTraderMulti:
             profit_to_tp = (abs(price - pos['entry_price']) / tp_distance) if tp_distance > 0 and (
                 (is_long and price > pos['entry_price']) or (not is_long and price < pos['entry_price'])) else 0
 
-            # Breakeven
             if profit_atr >= config.BREAKEVEN_ATR_MULTIPLE:
                 if is_long and pos['stop_loss'] < pos['entry_price']:
                     pos['stop_loss'] = pos['entry_price']
                 elif not is_long and pos['stop_loss'] > pos['entry_price']:
                     pos['stop_loss'] = pos['entry_price']
 
-            # Trailing stop
             if profit_atr >= 4.0:
                 trail = 2.5 * pos_atr if profit_atr >= 6.0 else 4.0 * pos_atr
                 new_sl = (pos['highest_price'] - trail) if is_long else (pos['lowest_price'] + trail)
                 if (is_long and new_sl > pos['stop_loss']) or (not is_long and new_sl < pos['stop_loss']):
                     pos['stop_loss'] = new_sl
 
-            # Partial TP
             if config.ENABLE_PARTIAL_TAKE_PROFIT and not pos['partial_closed'] and profit_to_tp >= config.PARTIAL_TP_THRESHOLD:
                 self._close_partial(symbol, pos['size'] * config.PARTIAL_CLOSE_PCT, price, "partial_tp")
                 pos['stop_loss'] = pos['entry_price']
                 pos['partial_closed'] = True
 
-            # Profit drawdown protection
             if config.ENABLE_PROFIT_DRAWDOWN_PROTECTION and not pos['retracement_activated'] and profit_to_tp >= config.RETRACEMENT_HIGH_THRESHOLD:
                 lock = tp_distance * config.RETRACEMENT_LOCK_THRESHOLD
                 pos['retracement_stop'] = pos['entry_price'] + lock if is_long else pos['entry_price'] - lock
                 pos['retracement_activated'] = True
 
-            # Trailing TP
             if config.ENABLE_TRAILING_TP and profit_atr >= config.TRAILING_TP_ATR_TRIGGER:
                 if not pos['trailing_tp_activated']:
                     pos['trailing_tp_activated'] = True
@@ -569,7 +641,6 @@ class LiveTraderMulti:
                 if (is_long and new_tp > pos['take_profit']) or (not is_long and new_tp < pos['take_profit']):
                     pos['take_profit'] = new_tp
 
-            # Time partial
             bar_age = (t - pos['entry_time']).total_seconds() / (config.BAR_MINUTES * 60)
             if config.ENABLE_TIME_PARTIAL and not pos['time_partial'] and not pos['partial_closed']:
                 if bar_age >= config.TIME_PARTIAL_BARS and profit_atr >= config.TIME_PARTIAL_PROFIT_ATR:
@@ -579,14 +650,11 @@ class LiveTraderMulti:
 
             # ---------- Exit checks ----------
             exit_reason = None
-
-            # Signal flip (two consecutive opposite signals)
             if is_long and signal == 'SELL' and getattr(self, '_prev_sig_' + symbol, None) == 'SELL':
                 exit_reason = "signal_flip"
             elif not is_long and signal == 'BUY' and getattr(self, '_prev_sig_' + symbol, None) == 'BUY':
                 exit_reason = "signal_flip"
 
-            # SMA cross: buffered + confirmed (THE FIX for the loss machine)
             if exit_reason is None and config.SMA_EXIT_ENABLED and len(df) >= config.SMA_EXIT_CONFIRM_BARS:
                 buf = config.SMA_EXIT_BUFFER_ATR
                 confirmed = True
@@ -601,11 +669,9 @@ class LiveTraderMulti:
                 if confirmed:
                     exit_reason = "sma_cross"
 
-            # Time limit
             if exit_reason is None and bar_age >= config.TIME_LIMIT_BARS:
                 exit_reason = "time_limit"
 
-            # Profit lock floor / SL / TP
             if is_long:
                 if pos['retracement_activated'] and pos['retracement_stop'] and price <= pos['retracement_stop']:
                     exit_reason = "profit_lock"
@@ -636,14 +702,23 @@ class LiveTraderMulti:
 
     # ------------------------------------------------------------------
     def run(self):
-        logger.info(f"LiveTraderMulti v2 starting: {self.symbols}")
-        send_telegram(f"🧠 Nexus Core v2 online. Symbols: {', '.join(self.symbols)}", kind='brain')
+        stock_syms = [s for s in self.symbols if not self._is_crypto(s)]
+        crypto_syms = [s for s in self.symbols if self._is_crypto(s)]
+        logger.info(f"LiveTraderMulti v3 | stocks={stock_syms} crypto={crypto_syms}")
+        send_telegram(f"🧠 Nexus Core v3 online.\nStocks: {', '.join(stock_syms) or '-'}\n"
+                      f"Crypto: {', '.join(crypto_syms) or '-'}\nMode: {config.UNIVERSE_MODE}", kind='brain')
+
         while self.running:
             try:
                 market_open = self.is_market_open()
                 self._maybe_send_eod(market_open)
-                if not market_open:
-                    logger.info("Market closed - sleeping 5 min")
+
+                # Crypto trades 24/7; stocks only in market hours
+                active = list(crypto_syms)
+                if market_open:
+                    active += stock_syms
+                if not active:
+                    logger.info("Market closed, no crypto - sleeping 5 min")
                     time.sleep(300)
                     continue
 
@@ -654,7 +729,7 @@ class LiveTraderMulti:
                     send_telegram(reporter.format_capital_update(
                         equity, self.day_start_equity, self.peak_equity, open_n), kind='heartbeat')
 
-                for sym in self.symbols:
+                for sym in active:
                     self.process_symbol(sym)
 
                 time.sleep(config.BAR_MINUTES * 60)
