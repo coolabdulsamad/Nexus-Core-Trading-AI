@@ -1,6 +1,6 @@
 """
 src/ingestion/fetcher.py
-Raw data acquisition from Polygon.io with retries.
+Raw data acquisition from Polygon.io (stocks + crypto).
 """
 import time
 import pandas as pd
@@ -48,6 +48,18 @@ class PolygonFetcher:
             logger.error(f"Fetch failed for {symbol}: {e}")
             time.sleep(2)
             return pd.DataFrame()
+
+    # Mapping for crypto pairs -> Polygon tickers
+    @staticmethod
+    def _polygon_crypto_ticker(symbol: str) -> str:
+        # "BTC/USD" -> "X:BTCUSD"
+        return "X:" + symbol.replace("/", "")
+
+    def fetch_crypto_bars(self, symbol: str, start_date: str, end_date: str,
+                          timespan: str = "minute", multiplier: int = 5) -> pd.DataFrame:
+        ticker = self._polygon_crypto_ticker(symbol)
+        logger.info(f"Fetching crypto {symbol} as {ticker}")
+        return self.fetch_historical_bars(ticker, start_date, end_date, timespan, multiplier)
 
     def fetch_latest_intraday(self, symbol: str, multiplier: int = 5) -> pd.DataFrame:
         end_date = datetime.now().strftime('%Y-%m-%d')

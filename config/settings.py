@@ -33,51 +33,51 @@ class GlobalConfig:
     BAR_MINUTES = 5                      # bar size used everywhere
 
     # ----- Brain (case-based memory) -----
-    MEMORY_NEIGHBORS = 100               # k nearest states to retrieve
-    MEMORY_MIN_AGE_MINUTES = 60          # neighbor must be >= this old (its 1h outcome fully known) -> kills look-ahead
-    MIN_NEIGHBOR_SIMILARITY = 0.50       # cosine floor; neighbors below this are ignored
-    MIN_NEIGHBOR_AGREEMENT = 0.55        # weighted fraction of neighbors agreeing on direction (0.5 = coin flip)
-    REGIME_FILTER_ENABLED = True         # prefer neighbors from the same market regime
-    BUY_THRESHOLD = 0.52                 # HOLD zone between 0.48 and 0.52
+    MEMORY_NEIGHBORS = 100
+    MEMORY_MIN_AGE_MINUTES = 60
+    MIN_NEIGHBOR_SIMILARITY = 0.50
+    MIN_NEIGHBOR_AGREEMENT = 0.55
+    REGIME_FILTER_ENABLED = True
+    BUY_THRESHOLD = 0.52
     SELL_THRESHOLD = 0.48
     PCA_COMPONENTS = 64
 
     # ----- Sentiment -----
-    USE_REAL_SENTIMENT = True            # FinBERT on real headlines (live only)
-    SENTIMENT_BIAS = 0.05                # live bias strength
-    SENTIMENT_IN_BACKTEST = False        # keep bias OFF in backtests (honesty)
+    USE_REAL_SENTIMENT = True
+    SENTIMENT_BIAS = 0.05
+    SENTIMENT_IN_BACKTEST = False
 
     # ----- Entry quality gate -----
-    ENTRY_CONVICTION_MARGIN = 0.015      # min |prob - 0.5|
-    MIN_SIGNAL_QUALITY = 0.20            # composite quality floor (0..1) to allow any trade
+    ENTRY_CONVICTION_MARGIN = 0.015
+    MIN_SIGNAL_QUALITY = 0.20
 
     # ----- Signal-strength position sizing (quality tiers) -----
-    QUALITY_STRONG = 0.60                # quality >= this -> strong tier
-    QUALITY_MEDIUM = 0.35                # quality >= this -> medium tier (below -> weak tier)
-    RISK_PCT_STRONG = 0.020              # 2.0% of slice risked on strong signals
-    RISK_PCT_MEDIUM = 0.010              # 1.0%
-    RISK_PCT_WEAK = 0.005                # 0.5%  (weak but tradable)
-    NOTIONAL_CAP_PCT = 0.75              # max notional per position, % of per-symbol capital
-    NOTIONAL_CAP_ABS = 75000             # absolute $ cap per position
+    QUALITY_STRONG = 0.60
+    QUALITY_MEDIUM = 0.35
+    RISK_PCT_STRONG = 0.020
+    RISK_PCT_MEDIUM = 0.010
+    RISK_PCT_WEAK = 0.005
+    NOTIONAL_CAP_PCT = 0.75
+    NOTIONAL_CAP_ABS = 75000
 
     # ----- Trade structure -----
-    STOP_ATR_MULT = 3.0                  # stop distance = 3 x ATR
-    REWARD_RISK_RATIO = 3.0              # TP = 3R
-    BREAKEVEN_ATR_MULTIPLE = 2.5         # move stop to entry after 2.5 x ATR profit
+    STOP_ATR_MULT = 3.0
+    REWARD_RISK_RATIO = 3.0
+    BREAKEVEN_ATR_MULTIPLE = 2.5
     SLIPPAGE_BPS = 0.0005
     COMMISSION_BPS = 0.0003
-    TIME_LIMIT_BARS = 48                 # full exit after N bars
+    TIME_LIMIT_BARS = 48
     COOLDOWN_BARS = 2
 
     # ----- SMA exit (fixed: buffered + confirmed) -----
     SMA_EXIT_ENABLED = True
-    SMA_EXIT_BUFFER_ATR = 0.25           # price must close 0.25 x ATR beyond SMA...
-    SMA_EXIT_CONFIRM_BARS = 2            # ...for 2 consecutive bars to trigger exit
+    SMA_EXIT_BUFFER_ATR = 0.25
+    SMA_EXIT_CONFIRM_BARS = 2
 
     # ----- Daily guards -----
-    DAILY_LOSS_LIMIT_PCT = 0.05          # stop trading the symbol day after -5%
-    DAILY_PROFIT_TARGET_PCT = 0.02       # +2% day -> stop opening new trades (0 = disabled)
-    DAILY_TARGET_LOCK_BREAKEVEN = True   # when target hit, move open stops to breakeven
+    DAILY_LOSS_LIMIT_PCT = 0.05
+    DAILY_PROFIT_TARGET_PCT = 0.02
+    DAILY_TARGET_LOCK_BREAKEVEN = True
 
     # ----- Profit locking (live) -----
     ENABLE_PARTIAL_TAKE_PROFIT = True
@@ -94,7 +94,7 @@ class GlobalConfig:
     TIME_PARTIAL_PROFIT_ATR = 0.5
 
     # ----- Data freshness -----
-    MAX_DATA_AGE_SECONDS = 600           # refuse to trade on bars older than 10 min
+    MAX_DATA_AGE_SECONDS = 600
     DATA_FETCH_TIMEOUT = 30
 
     # ----- Circuit breakers -----
@@ -106,8 +106,16 @@ class GlobalConfig:
     # ----- Notifications -----
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-    TELEGRAM_EOD_REPORT = True           # end-of-day analysis report
-    TELEGRAM_HEARTBEAT_CYCLES = 6        # equity heartbeat every N cycles (~30 min)
+    TELEGRAM_EOD_REPORT = True
+    TELEGRAM_HEARTBEAT_CYCLES = 6
+
+    # ----- Universe & daily selection (PR 2) -----
+    UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "manual")  # 'manual' = active DB symbols | 'auto' = daily top-N selector
+    TOP_N_SYMBOLS = 5                    # how many symbols the selector trades per day
+    CRYPTO_ENABLED = True
+    CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
+    SELECTOR_ATR_PCT_MIN = 0.0015        # volatility sweet spot for 5-min trading
+    SELECTOR_ATR_PCT_MAX = 0.030
 
     # ----- Misc -----
     WIN_RATE_WINDOW = 20
