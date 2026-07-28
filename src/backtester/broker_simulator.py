@@ -9,8 +9,14 @@ LONG:  cash -= entry_cost (+entry commission) at open; cash += proceeds (-exit
        commission) at close. Net effect = (exit-entry)*size - commissions.
 SHORT: margin-style. Principal does NOT move; only PnL settles at close.
        cash += (entry-exit)*size - commissions.
-While a position is open, equity = cash + sum(unrealized PnL) - which is
-exact for both models.
+
+Equity while positions are open (v2.2 fix):
+  LONG  -> cash + size*current_price   (market VALUE: cash already paid the
+           notional at open, so adding only unrealized PnL would subtract the
+           position's full value from equity -> fake 75% drawdowns)
+  SHORT -> cash + (entry-current)*size (unrealized PnL: principal never moved)
+Closed-trade PnL was always computed correctly; this only affected the equity
+curve, drawdown/Sharpe stats and the daily guards while LONGs were open.
 """
 from typing import Dict, List, Optional
 from config.settings import config
@@ -36,13 +42,13 @@ class BrokerSimulator:
 
     # ------------------------------------------------------------------
     def get_total_equity(self, current_price: float) -> float:
-        unrealized = 0.0
+        total = self.cash
         for pos in self.open_positions:
             if pos['type'] == 'LONG':
-                unrealized += (current_price - pos['entry_price']) * pos['size']
+                total += pos['size'] * current_price                      # market value
             else:
-                unrealized += (pos['entry_price'] - current_price) * pos['size']
-        return self.cash + unrealized
+                total += (pos['entry_price'] - current_price) * pos['size']  # unrealized
+        return total
 
     # ------------------------------------------------------------------
     def open_long(self, timestamp, entry_price, size, stop_loss, take_profit):
@@ -127,7 +133,7 @@ class BrokerSimulator:
                     fill = pos['stop_loss'] * (1 + SLIPPAGE_BPS)
                     to_close.append((pos, fill, "STOP_LOSS"))
                 elif tp_hit:
-                    fill = pos['take_profit'] * (1 + SLIPPAGE_BPS)
+                    fill = pos['take_profit'] * (1 - SLIPPAGE_BPS)
                     to_close.append((pos, fill, "TAKE_PROFIT"))
 
         for pos, fill, reason in to_close:
