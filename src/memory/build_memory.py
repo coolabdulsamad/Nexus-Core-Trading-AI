@@ -1,35 +1,35 @@
+#!/usr/bin/env python3
 """
 src/memory/build_memory.py
-Responsibility: Loads all data from TimescaleDB, compresses it to 64-dim vectors,
-and pushes it all to Qdrant to build the historical memory.
+Builds/rebuilds the brain's memory: DB features -> scaler+PCA -> Qdrant.
+Run from project root:  python -m src.memory.build_memory
+Then:                 python -m src.memory.backfill_forward_returns
+                      python -m src.memory.update_qdrant_payloads
 """
-import pandas as pd
 from src.memory.vector_encoder import VectorEncoder
 from src.memory.qdrant_memory import QdrantMemory
-from utils.logger import setup_logger
+from src.utils.logger import setup_logger
 
 logger = setup_logger("MemoryBuilder", "logs/memory.log")
 
+
 def main():
-    logger.info("===== STARTING MEMORY BUILD =====")
-    
-    # 1. Load data from DB
+    logger.info("===== MEMORY BUILD START =====")
     encoder = VectorEncoder()
     df = encoder.fetch_all_features()
     if df.empty:
         logger.error("No data to build memory.")
         return
-    
-    # 2. Compress to 64-dim vectors
-    logger.info("Fitting PCA and transforming data...")
+
+    logger.info("Fitting scaler + PCA ...")
     vectors = encoder.fit_transform(df)
-    
-    # 3. Push to Qdrant
+
     qdrant = QdrantMemory()
     qdrant.upsert_batch(df, vectors)
-    
-    logger.info("===== MEMORY BUILD COMPLETED =====")
-    logger.info(f"Total vectors stored: {len(vectors)}")
+
+    logger.info(f"===== MEMORY BUILD COMPLETE: {len(vectors)} states =====")
+    logger.info("Next: backfill_forward_returns, then update_qdrant_payloads.")
+
 
 if __name__ == "__main__":
     main()
