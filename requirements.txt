@@ -5,7 +5,11 @@ numpy==1.26.2
 # Databases
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
-qdrant-client==1.7.0
+# qdrant-client must roughly match the server version in docker-compose
+# (image: qdrant/qdrant:latest). 1.7.0 was too old to parse the newer
+# server's collection-info response -> pydantic ValidationError on
+# build_memory. Keep the client current.
+qdrant-client>=1.12
 
 # Technical analysis (C library - see README for install)
 TA-Lib>=0.4.32
@@ -25,6 +29,6 @@ transformers>=4.40
 
 # Utils
 python-dotenv==1.0.0
-pydantic==2.5.0
+pydantic>=2.7,<3
 requests==2.31.0
 python-json-logger==2.0.7
