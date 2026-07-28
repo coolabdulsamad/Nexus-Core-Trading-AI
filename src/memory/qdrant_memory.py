@@ -7,6 +7,9 @@ FIXED:
 - Numeric epoch 'ts' payload field so searches can be time-filtered
   (this is what makes look-ahead-free backtesting possible).
 - Regime label stored per point; searches can be regime-filtered.
+- search_similar uses the modern query_points API (qdrant-client >=1.10
+  deprecated and then REMOVED client.search); falls back to the legacy
+  call only if an old client is installed.
 
 NOTE: after upgrading, rebuild the memory (python -m src.memory.build_memory)
 - old points use the colliding ID scheme.
@@ -107,13 +110,25 @@ class QdrantMemory:
 
         query_filter = models.Filter(must=must) if must else None
 
-        results = self.client.search(
-            collection_name=self.collection_name,
-            query_vector=vector.tolist(),
-            query_filter=query_filter,
-            limit=limit,
-            with_payload=True,
-        )
+        # qdrant-client >=1.10: query_points (client.search was removed in
+        # recent releases). Fall back to the legacy call for old clients.
+        if hasattr(self.client, "query_points"):
+            response = self.client.query_points(
+                collection_name=self.collection_name,
+                query=vector.tolist(),
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            results = response.points
+        else:
+            results = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=vector.tolist(),
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
 
         return [{
             'score': hit.score,
