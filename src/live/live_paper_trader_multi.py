@@ -12,6 +12,14 @@ Pipeline per cycle per symbol:
   config lists.
 - Stocks trade only when the market is open; crypto trades 24/7.
 - 1h bars: same brain/memory as the honest backtester (market_memory_60m).
+
+v3.0.1 fixes:
+- get_bars: Alpaca returns bars ASCENDING from `start`, so a small API
+  limit returns the OLDEST bars (crypto showed 660h-old data, and
+  get_latest_price fetched 40-day-old prices). Now fetches the full
+  window server-side and tails client-side.
+- _send_eod / _send_heartbeat: corrected to reporter.py's actual
+  signatures (trade dict list + day_start/peak equity).
 """
 import os
 import sys
@@ -65,12 +73,9 @@ TRAILING_STOP_ACTIVATE = 4.0      # ATR profit to activate hard trailing stop
 TRAILING_STOP_DISTANCE = 6.0      # ATR behind price
 TRAILING_STOP_ENABLED = True
 
-SLIPPAGE_PCT = 0.0008
 MAX_SPREAD_PCT = 0.002
 
-ATR_PERIOD = 14
 ATR_SMA_PERIOD = 50
-MAX_ATR_MULTIPLE = 3.0
 
 SMA_PERIOD = 200                  # 200 1h bars ~= 1 month
 SMA_EXIT_ENABLED = config.SMA_EXIT_ENABLED
@@ -109,6 +114,7 @@ class MultiSymbolPaperTrader:
         self.meta_learner = MetaLearner()
         self._selector = None
         self._last_selection_date = None
+        self._peak_equity = 0.0
 
         # Universe (DB + selector, config fallback)
         self.symbols, self.crypto_symbols = self._resolve_universe()
@@ -221,13 +227,14 @@ class MultiSymbolPaperTrader:
         return self.crypto_data_client if self._is_crypto(symbol) else self.stock_data_client
 
     def get_bars(self, symbol: str, limit: int = 300) -> Optional[pd.DataFrame]:
+        """Latest `limit` CLOSED+forming 1h bars (most recent last)."""
         try:
             request_cls = CryptoBarsRequest if self._is_crypto(symbol) else StockBarsRequest
             req = request_cls(
                 symbol_or_symbols=[symbol],
                 timeframe=TimeFrame.Hour,
                 start=datetime.now(timezone.utc) - timedelta(days=40),
-                limit=limit,
+                limit=10000,   # fetch the whole window; Alpaca returns ASC from start
             )
             client = self._get_data_client(symbol)
             bars = (client.get_crypto_bars(req) if self._is_crypto(symbol)
@@ -236,8 +243,8 @@ class MultiSymbolPaperTrader:
             if df.empty or symbol not in df.index.get_level_values(0):
                 return None
             df = df.xs(symbol).reset_index()
-            df = df.rename(columns={"timestamp": "timestamp", "vwap": "vwap"})
-            return df.sort_values("timestamp").reset_index(drop=True)
+            df = df.sort_values("timestamp").tail(limit).reset_index(drop=True)
+            return df
         except Exception as e:
             logger.error(f"{symbol} bar fetch failed: {e}")
             return None
@@ -671,12 +678,20 @@ class MultiSymbolPaperTrader:
         return True, 'ok'
 
     # ================= Reports =================
+    def _day_start_equity(self, fallback: float) -> float:
+        return next((v for v in self.daily_start_equity.values() if v), fallback)
+
     def _send_eod(self):
         try:
             account = self.get_account()
-            stats = {'total_trades': sum(len(v) for v in self.daily_trades.values()),
-                     'realized_pnl': sum(self.daily_realized_pnl.values())}
-            send_eod_report(stats, float(account.equity), config.symbols)
+            equity = float(account.equity)
+            trades = []
+            for sym, tl in self.daily_trades.items():
+                for t in tl:
+                    trades.append({'symbol': sym, 'pnl': t['pnl'], 'reason': t['reason']})
+            open_pos = {s: self.position_side[s] for s in self.all_symbols
+                        if self.in_position.get(s)}
+            send_eod_report(trades, equity, self._day_start_equity(equity), open_pos)
             self.last_report_date = datetime.now(timezone.utc).date()
         except Exception as e:
             logger.error(f"EOD report failed: {e}")
@@ -684,12 +699,12 @@ class MultiSymbolPaperTrader:
     def _send_heartbeat(self):
         try:
             account = self.get_account()
+            equity = float(account.equity)
+            self._peak_equity = max(self._peak_equity, equity)
             open_syms = [s for s in self.all_symbols if self.in_position.get(s)]
             send_telegram(format_capital_update(
-                equity=float(account.equity),
-                cash=float(account.cash),
-                open_positions=len(open_syms),
-                symbols_open=open_syms), 'heartbeat')
+                equity, self._day_start_equity(equity), self._peak_equity,
+                len(open_syms)), 'heartbeat')
         except Exception as e:
             logger.error(f"Heartbeat failed: {e}")
 
