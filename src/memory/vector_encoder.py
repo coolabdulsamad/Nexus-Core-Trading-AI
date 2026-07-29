@@ -1,10 +1,13 @@
 """
-src/memory/vector_encoder.py  (v2)
+src/memory/vector_encoder.py  (v3)
 Compresses each market state into a PCA vector for the memory.
 
 v2: all vector features are SCALE-FREE (ratios, %, ATR units, z-scores),
 so states are comparable across symbols and price levels. Raw price-scale
 columns stay in the DB but are NOT used in the vector.
+
+v3: timeframe-aware - reads market_data{BAR_SUFFIX} / feature_cache{BAR_SUFFIX}
+so the same encoder serves 5-min and 1h data layers.
 """
 import os
 import joblib
@@ -53,10 +56,11 @@ class VectorEncoder:
         if symbols is None:
             symbols = config.symbols
 
-        query = """
+        suffix = config.BAR_SUFFIX
+        query = f"""
             SELECT f.*, m.close, m.vwap
-            FROM feature_cache f
-            JOIN market_data m ON f.symbol = m.symbol AND f.time_bucket = m.time_bucket
+            FROM feature_cache{suffix} f
+            JOIN market_data{suffix} m ON f.symbol = m.symbol AND f.time_bucket = m.time_bucket
             WHERE f.symbol = ANY(%s)
             ORDER BY f.time_bucket ASC
         """
@@ -67,7 +71,7 @@ class VectorEncoder:
 
         df = self._prepare(df)
         df = df.dropna(subset=['vwap', 'close'])
-        logger.info(f"Loaded {len(df)} feature rows from database.")
+        logger.info(f"Loaded {len(df)} feature rows from database (tables: *{suffix or ' (5-min)'}).")
         return df
 
     # ------------------------------------------------------------------

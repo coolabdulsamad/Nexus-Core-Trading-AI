@@ -2,6 +2,12 @@
 config/settings.py
 Single source of truth for Nexus Core.
 Secrets come ONLY from environment / .env - never hardcode credentials here.
+
+v3: the system runs on 1-HOUR bars. Five-symbol honest backtests proved
+5-minute similar-state recall has no edge after costs (PF 0.41-0.74 on
+AAPL/TSLA/NVDA/MSFT/GOOGL) - losses came from noise-churning, not risk
+management. Hourly bars cut trade frequency ~12x, shrink costs relative
+to moves, and make recalled states actually comparable.
 """
 import os
 from dotenv import load_dotenv
@@ -30,10 +36,11 @@ class GlobalConfig:
 
     # ----- Universe -----
     symbols = ["AAPL", "TSLA", "MSFT", "GOOGL", "NVDA"]
-    BAR_MINUTES = 5                      # bar size used everywhere
+    BAR_MINUTES = 60                     # v3: 1-hour bars (60) or 5-min (5)
+    BAR_SUFFIX = "_1h" if BAR_MINUTES == 60 else ""   # DB table suffix
 
     # ----- Brain (case-based memory) -----
-    FORWARD_HORIZON_HOURS = 4            # prediction target: realised return N hours ahead
+    FORWARD_HORIZON_HOURS = 4            # prediction target: N hours ahead (4 bars on 1h)
     MEMORY_NEIGHBORS = 100               # k nearest states to retrieve
     # Neighbor must be older than the horizon (+1h buffer) so its outcome
     # was fully known at decision time -> kills look-ahead.
@@ -63,26 +70,22 @@ class GlobalConfig:
     NOTIONAL_CAP_PCT = 0.75              # max notional per position, % of per-symbol capital
     NOTIONAL_CAP_ABS = 75000             # absolute $ cap per position
 
-    # ----- Trade structure -----
-    # v2.1: TP was 3R on a 3xATR stop = 9xATR away - unreachable inside the
-    # time limit on 5-min bars. Now: SL 3xATR, TP 4.5xATR (R:R 1.5),
-    # breakeven lock at 1.5xATR.
-    # v2.2: with a 4h prediction horizon the time limit doubles to 96 bars
-    # (8h = 2x horizon) so trades can actually reach the 4.5xATR target.
-    STOP_ATR_MULT = 3.0                  # stop distance = 3 x ATR
-    REWARD_RISK_RATIO = 1.5              # TP = 1.5R
+    # ----- Trade structure (1h recalibration) -----
+    # 1h ATR is ~3-4x the 5-min ATR, so stops get tighter in ATR units:
+    # SL 2xATR, TP 3xATR (R:R 1.5), breakeven at 1.5xATR.
+    STOP_ATR_MULT = 2.0                  # stop distance = 2 x ATR(1h)
+    REWARD_RISK_RATIO = 1.5              # TP = 1.5R (3 x ATR)
     BREAKEVEN_ATR_MULTIPLE = 1.5         # move stop to entry after 1.5 x ATR profit
     SLIPPAGE_BPS = 0.0005
     COMMISSION_BPS = 0.0003
-    TIME_LIMIT_BARS = 96                 # full exit after N bars (96 = 8h = 2x horizon)
-    COOLDOWN_BARS = 2
+    TIME_LIMIT_BARS = 8                  # full exit after 8 hourly bars (8h = 2x horizon)
+    COOLDOWN_BARS = 1
 
-    # ----- SMA exit (DISABLED in v2.1) -----
-    # Structurally guaranteed-loss exit: a LONG may only enter above the 200
-    # SMA, so exiting when price closes 0.25xATR BELOW it always realizes a
-    # loss. SL/TP + signal_flip + time_limit already cover every exit case.
+    # ----- SMA exit (DISABLED) -----
+    # Structurally guaranteed-loss exit (entries require price beyond the
+    # 200 SMA; exits fired beyond it in the losing direction).
     SMA_EXIT_ENABLED = False
-    SMA_EXIT_BUFFER_ATR = 0.25           # (kept for reference if re-enabled)
+    SMA_EXIT_BUFFER_ATR = 0.25
     SMA_EXIT_CONFIRM_BARS = 2
 
     # ----- Daily guards -----
