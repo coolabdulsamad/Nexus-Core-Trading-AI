@@ -161,7 +161,7 @@ class MultiSymbolPaperTrader:
                 crypto = [p['symbol'] for p in picks if p['asset_type'] == 'crypto']
                 logger.info(f"Universe (auto top-{config.TOP_N_SYMBOLS}): {stocks} + {crypto}")
                 return stocks, crypto
-            rows = mgr.get_active()
+            rows = mgr.list_symbols(active_only=True)
             stocks = [r['symbol'] for r in rows if r['asset_type'] == 'stock']
             crypto = [r['symbol'] for r in rows if r['asset_type'] == 'crypto']
             if stocks or crypto:
@@ -204,6 +204,7 @@ class MultiSymbolPaperTrader:
         self.breakeven_set[s] = False
         self.trailing_tp_set[s] = False
         self.partial_closed[s] = False
+        self.time_partial_done[s] = False
         self.entry_bar_time[s] = None
         self.last_flip_signal[s] = None
         self.flip_count[s] = 0
@@ -214,7 +215,6 @@ class MultiSymbolPaperTrader:
         self.daily_start_equity[s] = None
         self.daily_realized_pnl[s] = 0.0
         self.daily_target_hit[s] = False
-        self.time_partial_done[s] = False
 
     # ================= Market data =================
     def _get_data_client(self, symbol: str):
@@ -249,7 +249,7 @@ class MultiSymbolPaperTrader:
         return float(df.iloc[-1]['close'])
 
     def compute_indicators(self, df: pd.DataFrame) -> Optional[pd.Series]:
-        """Latest row with the full v2 indicator set (same as backtester)."""
+        """Latest CLOSED bar with the full v2 indicator set (same as backtester)."""
         try:
             if len(df) < SMA_PERIOD + 5:
                 return None
@@ -263,9 +263,8 @@ class MultiSymbolPaperTrader:
             atr_sma = feats['atr_14'].rolling(ATR_SMA_PERIOD).mean().iloc[-1]
             latest['atr_50_avg'] = atr_sma
             latest['volatility_ratio'] = (latest['atr_14'] / atr_sma) if atr_sma and not np.isnan(atr_sma) else 1.0
-            # data freshness: drop the still-open bar -> check the last CLOSED bar
+            # if the last bar is still forming, use the previous CLOSED one
             if pd.Timestamp(df.iloc[-1]['timestamp']) > pd.Timestamp.now(tz='UTC') - pd.Timedelta(hours=1):
-                # last bar is still forming -> use the previous one
                 latest = feats.iloc[-2].copy()
                 latest['close'] = df.iloc[-2]['close']
                 latest['sma_200'] = df['close'].rolling(SMA_PERIOD).mean().iloc[-2]
@@ -345,9 +344,12 @@ class MultiSymbolPaperTrader:
         self.cancel_symbol_orders(symbol)
         ok = self._execute_order(symbol, side, qty, f"CLOSE({reason})")
         if ok:
-            pnl = (self.get_latest_price(symbol) - self.entry_price[symbol]) * qty \
+            price = self.get_latest_price(symbol)
+            if price is None:
+                price = self.entry_price[symbol]
+            pnl = (price - self.entry_price[symbol]) * qty \
                 if self.position_side[symbol] == 'LONG' else \
-                (self.entry_price[symbol] - self.get_latest_price(symbol)) * qty
+                (self.entry_price[symbol] - price) * qty
             self.daily_realized_pnl[symbol] += pnl
             self.daily_trades[symbol].append({'time': datetime.now(timezone.utc), 'pnl': pnl, 'reason': reason})
             self._reset_position_state(symbol)
@@ -618,7 +620,7 @@ class MultiSymbolPaperTrader:
 
         # 9) SMA cross exit (disabled by config)
         if SMA_EXIT_ENABLED:
-            df_full = df_full if 'df_full' in dir() else self.get_bars(symbol)
+            df_full = self.get_bars(symbol)
             if df_full is not None and len(df_full) >= SMA_PERIOD + SMA_EXIT_CONFIRM_BARS + 1:
                 sma = df_full['close'].rolling(SMA_PERIOD).mean()
                 closes = df_full['close'].values
