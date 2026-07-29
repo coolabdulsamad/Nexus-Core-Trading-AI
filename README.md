@@ -7,61 +7,73 @@ similar **past** states and trades on what actually happened next.
 **Stack:** TimescaleDB (bars + features) · Qdrant (memory) · Polygon.io
 (history) · Alpaca (live paper trading) · FinBERT (news sentiment) · Telegram.
 
-## What's new in v2 (this branch)
+## v2 — truth fixes + brain upgrade (merged)
 
-**Honesty fixes**
-- Look-ahead bias removed: memory search is time-filtered, the current bar
-  can never retrieve itself or future states.
-- Broker P&L no longer double-counted; SL/TP detected with bar high/low.
-- Qdrant point IDs are unique per (symbol, timestamp) — multi-symbol memory
-  no longer overwrites itself.
-- Short-signal gate fixed (conviction-based, symmetric).
-- MD5 "synthetic sentiment" noise channel removed.
+Look-ahead removed · broker double-PnL fixed · unique memory IDs · symmetric
+short gate · honest sentiment · 17 scale-free features · regime labels ·
+neighbor-agreement gate · signal quality score · signal-strength sizing ·
+daily profit target · buffered sma_cross exit · data-freshness guard ·
+Telegram EOD reports.
 
-**Brain v2**
-- 17 scale-free features (momentum, ADX, BB %B, vol z-score, time-of-day…).
-- Regime labels (trend_up / trend_down / range) + regime-filtered recall.
-- Neighbor-agreement gate: no trade when memory is ambivalent.
-- Signal **quality score** (0–1) on every decision.
+## v3 — universe + crypto (this branch)
 
-**Money management**
-- Signal-strength sizing: STRONG/MEDIUM/WEAK tiers risk different %.
-- Daily profit target: hit it → stop trading, lock open trades to breakeven.
-- `sma_cross` exit fixed: buffered (0.25×ATR) + confirmed (2 bars).
-
-**Ops**
-- Data-freshness guard (no trading on >10-min-old bars) with lag reporting.
-- Telegram: entries/exits/partials/guards + heartbeat capital updates +
-  end-of-day analysis report.
+- **Symbol universe lives in the DB** (`symbols` table) — no hardcoded lists.
+  `SymbolManager.add_symbol()` verifies tradability on Alpaca before activating.
+- **Daily top-N selection** (`UNIVERSE_MODE=auto`): the `DailySelector` scores
+  every active symbol each morning — 45% brain edge, 20% regime, 15% volatility
+  fit, 10% liquidity, 10% news sentiment — and trades only the best N
+  (default 5). Scores + reasons persisted in `daily_selection`.
+- **Crypto**: BTC/USD, ETH/USD, SOL/USD — 24/7 trading, fractional quantities,
+  GTC orders, Alpaca crypto feed, Polygon `X:` backfill.
+- Ingestion pump is universe-driven (stocks + crypto).
 
 ## Setup
 
 ```bash
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 # TA-Lib C library: https://github.com/ta-lib/ta-lib-python#installation
 
-cp .env.example .env   # fill in keys: DATABASE_URL, POLYGON_API_KEY,
-                       # ALPACA_API_KEY, ALPACA_SECRET_KEY,
-                       # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NEWS_API_KEY
+cp .env.example .env   # DATABASE_URL, POLYGON_API_KEY, ALPACA_API_KEY,
+                       # ALPACA_SECRET_KEY, TELEGRAM_BOT_TOKEN,
+                       # TELEGRAM_CHAT_ID, NEWS_API_KEY, UNIVERSE_MODE
 
 make start             # TimescaleDB + Qdrant via docker-compose
 ```
 
-Existing database? Run the migration once:
+### Migrations (existing databases)
+
+No local `psql`? Run through Docker:
 
 ```bash
-psql "$DATABASE_URL" -f database/migrations/002_brain_v2.sql
+docker ps   # find the timescaledb container, e.g. nexus_core-db-1
+docker exec -i <container> psql -U postgres -d nexus_core < database/migrations/002_brain_v2.sql
+docker exec -i <container> psql -U postgres -d nexus_core < database/migrations/003_universe.sql
 ```
 
-## Rebuild the brain (required after this upgrade)
-
-Old memory used colliding IDs and old features — rebuild:
+## Rebuild the brain (required once after v2)
 
 ```bash
-python -m src.ingestion.run_pump              # fresh data + features v2
-python -m src.memory.build_memory             # scaler+PCA -> Qdrant
-python -m src.memory.backfill_forward_returns # realised outcomes
-python -m src.memory.update_qdrant_payloads   # outcomes -> memory
+source venv/bin/activate
+python -m src.ingestion.run_pump
+python -m src.memory.build_memory
+python -m src.memory.backfill_forward_returns
+python -m src.memory.update_qdrant_payloads
+```
+
+## Manage the universe
+
+```bash
+python -m src.universe.symbol_manager           # list all symbols
+python -m src.universe.selector                 # run today's top-N selection
+```
+
+Add crypto to the universe (one time, in Python or psql):
+
+```sql
+INSERT INTO symbols (symbol, asset_type, active) VALUES
+  ('BTC/USD','crypto',TRUE), ('ETH/USD','crypto',TRUE), ('SOL/USD','crypto',TRUE)
+ON CONFLICT DO NOTHING;
 ```
 
 ## Honest backtest
@@ -70,8 +82,7 @@ python -m src.memory.update_qdrant_payloads   # outcomes -> memory
 python -m src.backtester.engine AAPL 2026-03-24 2026-06-24
 ```
 
-The summary now includes an **exit-reason breakdown** — watch whether
-`sma_cross` still loses after the fix.
+Includes the exit-reason breakdown (watch `sma_cross`).
 
 ## Live paper trading
 
@@ -79,5 +90,8 @@ The summary now includes an **exit-reason breakdown** — watch whether
 python -m src.live.live_paper_trader_multi
 ```
 
-All knobs live in `config/settings.py` (thresholds, tiers, daily target,
-SMA-exit buffer, freshness, notifications).
+- `UNIVERSE_MODE=manual` → trades all active symbols in the DB
+- `UNIVERSE_MODE=auto`   → trades the daily top-N selection
+- Crypto trades 24/7; stocks only during market hours.
+
+All knobs live in `config/settings.py`.

@@ -8,6 +8,10 @@ v3: the system runs on 1-HOUR bars. Five-symbol honest backtests proved
 AAPL/TSLA/NVDA/MSFT/GOOGL) - losses came from noise-churning, not risk
 management. Hourly bars cut trade frequency ~12x, shrink costs relative
 to moves, and make recalled states actually comparable.
+
+PR2: symbol universe (DB-backed, Alpaca-verified), daily top-N selection,
+crypto support. This file merges the PR2 additions onto main's v3 config
+(so the PR merges without conflicts).
 """
 import os
 from dotenv import load_dotenv
@@ -38,6 +42,14 @@ class GlobalConfig:
     symbols = ["AAPL", "TSLA", "MSFT", "GOOGL", "NVDA"]
     BAR_MINUTES = 60                     # v3: 1-hour bars (60) or 5-min (5)
     BAR_SUFFIX = "_1h" if BAR_MINUTES == 60 else ""   # DB table suffix
+
+    # ----- Universe management (PR2) -----
+    UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "manual")   # 'manual' (DB active list) | 'auto' (daily selector)
+    TOP_N_SYMBOLS = 5                    # how many symbols the selector trades per day
+    CRYPTO_ENABLED = True
+    CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
+    SELECTOR_ATR_PCT_MIN = 0.0015        # volatility fit floor for the daily selector
+    SELECTOR_ATR_PCT_MAX = 0.030         # volatility fit ceiling
 
     # ----- Brain (case-based memory) -----
     FORWARD_HORIZON_HOURS = 4            # prediction target: N hours ahead (4 bars on 1h)
