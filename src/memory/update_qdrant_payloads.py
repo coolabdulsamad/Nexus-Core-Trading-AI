@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-src/memory/update_qdrant_payloads.py
+src/memory/update_qdrant_payloads.py  (v3)
 Syncs realised forward returns (1h + active horizon) + regime labels from
 TimescaleDB into Qdrant.
 
+- Timeframe-aware: reads market_data{BAR_SUFFIX}/feature_cache{BAR_SUFFIX}.
 - Targets EXACTLY the rows that were encoded into Qdrant (same JOIN,
-  same symbol filter, same vwap/close not-null rule as
-  vector_encoder.fetch_all_features), so point ids match 1:1.
+  same symbol filter, same vwap/close not-null rule as the encoder), so
+  point ids match 1:1.
 - Sends updates in BATCHES via batch_update_points (one HTTP round trip
   per 100 points instead of one per point).
 
@@ -22,22 +23,23 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("UpdateQdrantPayloads", "logs/memory.log")
 
-COLLECTION = "market_memory"
 BATCH_SIZE = 100
 HORIZON_KEY = f"forward_return_{config.FORWARD_HORIZON_HOURS}h"
 
 
 def main():
-    logger.info(f"===== QDRANT PAYLOAD UPDATE (batched, horizon key: {HORIZON_KEY}) =====")
+    suffix = config.BAR_SUFFIX
+    collection = f"market_memory_{config.BAR_MINUTES}m"
+    logger.info(f"===== QDRANT PAYLOAD UPDATE (collection: {collection}, key: {HORIZON_KEY}) =====")
     symbols = list(config.symbols)
 
     conn = psycopg2.connect(config.database.url)
     df = pd.read_sql(
-        """
+        f"""
         SELECT f.symbol, f.time_bucket, f.forward_return_1h, f.forward_return_4h,
                f.regime_label, m.close, m.vwap
-        FROM feature_cache f
-        JOIN market_data m
+        FROM feature_cache{suffix} f
+        JOIN market_data{suffix} m
           ON f.symbol = m.symbol AND f.time_bucket = m.time_bucket
         WHERE f.symbol = ANY(%s)
         """,
@@ -52,7 +54,7 @@ def main():
     df = df[df[HORIZON_KEY].notna()]
     logger.info(f"{len(df)} memory rows with realised {config.FORWARD_HORIZON_HOURS}h outcomes.")
     if df.empty:
-        logger.warning("Nothing to update - run backfill_forward_returns first.")
+        logger.warning("Nothing to update - build the data layer first.")
         return
 
     df['point_id'] = [
@@ -68,7 +70,7 @@ def main():
         nonlocal updated, failed_batches
         try:
             client.batch_update_points(
-                collection_name=COLLECTION,
+                collection_name=collection,
                 update_operations=ops,
                 wait=True,
             )

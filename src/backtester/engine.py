@@ -1,16 +1,15 @@
 """
-src/backtester/engine.py  (v2.1)
+src/backtester/engine.py  (v3)
 Honest backtesting:
 - MetaLearner runs in mode='backtest' -> memory search is time-filtered,
   no look-ahead, no future sentiment.
 - Conviction gate |prob-0.5| works for BOTH longs and shorts.
 - Signal QUALITY gates entry and drives position size tier.
 - SL/TP detection uses bar high/low with fills at stop/limit prices.
-- v2.1: breakeven stop rule is actually APPLIED every bar (it was
-  configured but never called in v2, so winners never got locked).
-- v2.1: sma_cross exit disabled by config (structurally guaranteed-loss:
-  entries require price beyond the 200 SMA, exits fire beyond it in the
-  losing direction).
+- Breakeven stop rule applied every bar.
+- sma_cross exit disabled (structurally guaranteed-loss).
+- v3: timeframe-aware - reads market_data{BAR_SUFFIX}/feature_cache{BAR_SUFFIX}
+  and annualizes Sharpe with the correct bars-per-day for the timeframe.
 """
 import psycopg2
 import pandas as pd
@@ -24,6 +23,7 @@ from src.models.meta_learner import MetaLearner
 logger = setup_logger("BacktesterEngine", "logs/backtester.log")
 
 BAR_SECONDS = config.BAR_MINUTES * 60
+BARS_PER_DAY = 390 / config.BAR_MINUTES          # 78 at 5-min, 6.5 at 1h
 
 
 class BacktesterEngine:
@@ -40,32 +40,33 @@ class BacktesterEngine:
         self.cooldown = 0
 
     def fetch_data(self) -> pd.DataFrame:
-        df = pd.read_sql("""
+        suffix = config.BAR_SUFFIX
+        df = pd.read_sql(f"""
             SELECT m.time_bucket AS timestamp, m.open, m.high, m.low, m.close, m.volume, m.vwap,
                    f.rsi_14, f.macd_line, f.macd_signal, f.macd_hist,
                    f.bb_pct_b, f.bb_width, f.atr_14, f.atr_pct,
                    f.volume_profile_ratio, f.vol_z, f.ret_1, f.ret_3, f.ret_12,
                    f.adx_14, f.dist_sma50, f.dist_sma200, f.dist_vwap,
                    f.hour_sin, f.hour_cos, f.sentiment_score, f.regime_label
-            FROM market_data m
-            JOIN feature_cache f ON m.symbol = f.symbol AND m.time_bucket = f.time_bucket
+            FROM market_data{suffix} m
+            JOIN feature_cache{suffix} f ON m.symbol = f.symbol AND m.time_bucket = f.time_bucket
             WHERE m.symbol = %s AND m.time_bucket BETWEEN %s AND %s
             ORDER BY m.time_bucket ASC
         """, self.conn, params=(self.symbol, self.start_date, self.end_date))
         if df.empty:
-            logger.error(f"No data for {self.symbol}")
+            logger.error(f"No data for {self.symbol} (tables *{suffix or ' (5-min)'})")
             return df
 
         df['sma_200'] = df['close'].rolling(200).mean()
         df['atr_50_avg'] = df['atr_14'].rolling(50).mean()
         df['volatility_ratio'] = df['atr_14'] / df['atr_50_avg']
         df = df.dropna(subset=['sma_200', 'atr_50_avg'])
-        logger.info(f"Loaded {len(df)} candles for {self.symbol}")
+        logger.info(f"Loaded {len(df)} candles for {self.symbol} ({config.BAR_MINUTES}-min bars)")
         return df
 
     # ------------------------------------------------------------------
     def _sma_exit_confirmed(self, idx, direction) -> bool:
-        """Buffered + confirmed SMA cross exit (disabled by config in v2.1)."""
+        """Buffered + confirmed SMA cross exit (disabled by config)."""
         if not config.SMA_EXIT_ENABLED:
             return False
         need = config.SMA_EXIT_CONFIRM_BARS
@@ -85,7 +86,7 @@ class BacktesterEngine:
         self.df = self.fetch_data().reset_index(drop=True)
         if self.df.empty:
             return
-        logger.info(f"Starting honest AI backtest for {self.symbol}...")
+        logger.info(f"Starting honest AI backtest for {self.symbol} ({config.BAR_MINUTES}-min)...")
 
         for idx, row in self.df.iterrows():
             price = row['close']
@@ -110,7 +111,7 @@ class BacktesterEngine:
                     self.risk.record_realized_pnl(last['pnl'])
                     last['_counted'] = True
 
-            # 2b. Breakeven stop lock (v2.1: was configured but never applied)
+            # 2b. Breakeven stop lock
             for pos in self.broker.open_positions:
                 self.risk.update_breakeven_stop(pos, price, atr)
 
@@ -198,7 +199,7 @@ class BacktesterEngine:
 
         eq = pd.Series([e['equity'] for e in self.broker.equity_curve])
         rets = eq.pct_change().dropna()
-        sharpe = (rets.mean() / rets.std() * np.sqrt(78 * 252)) if len(rets) > 1 and rets.std() != 0 else 0
+        sharpe = (rets.mean() / rets.std() * np.sqrt(BARS_PER_DAY * 252)) if len(rets) > 1 and rets.std() != 0 else 0
         max_dd = ((eq.cummax() - eq) / eq.cummax()).max() * 100
 
         trades = self.broker.closed_trades
@@ -207,7 +208,7 @@ class BacktesterEngine:
         win_rate = len(wins) / len(trades) * 100 if trades else 0
 
         print("\n" + "=" * 60)
-        print(f"HONEST AI BACKTEST: {self.symbol}")
+        print(f"HONEST AI BACKTEST: {self.symbol} ({config.BAR_MINUTES}-min bars)")
         print("=" * 60)
         print(f"Period:         {self.start_date} -> {self.end_date}")
         print(f"Initial:        ${init:,.2f}   Final: ${final:,.2f}   Return: {ret_pct:+.2f}%")

@@ -1,15 +1,14 @@
 """
-src/memory/qdrant_memory.py
-FIXED:
+src/memory/qdrant_memory.py  (v3)
 - Deterministic UNIQUE point IDs (uuid5 of symbol+timestamp).
 - Numeric epoch 'ts' payload field for time-filtered search (look-ahead guard).
 - Regime label stored per point; searches can be regime-filtered.
 - search_similar uses the modern query_points API (client.search was removed
   in recent qdrant-client releases); legacy fallback kept for old clients.
-- v2.2.1: search_similar now returns the FULL payload. The old whitelist
-  (forward_return_1h only) silently dropped forward_return_4h, so the v2.2
-  brain saw 0 usable neighbours everywhere and the backtest ran 798
-  trend_fallback trades. Never whitelist payload keys again.
+- search_similar returns the FULL payload (plus 'score') - never whitelist
+  payload keys again (the 1h-only whitelist silently zeroed the v2.2 brain).
+- v3: collection is timeframe-aware: market_memory_{BAR_MINUTES}m
+  (market_memory_5m stays as the 5-min archive, market_memory_60m is v3).
 """
 import uuid
 from typing import List, Dict, Optional
@@ -33,7 +32,7 @@ def make_point_id(symbol: str, ts_epoch: int) -> str:
 class QdrantMemory:
     def __init__(self):
         self.client = QdrantClient(host=config.qdrant.host, port=config.qdrant.port)
-        self.collection_name = "market_memory"
+        self.collection_name = f"market_memory_{config.BAR_MINUTES}m"
 
     # ------------------------------------------------------------------
     def ensure_collection(self, vector_size: int):
@@ -60,7 +59,7 @@ class QdrantMemory:
                 self.client.create_payload_index(self.collection_name, field, schema)
             except Exception as e:
                 logger.warning(f"Index on {field} skipped: {e}")
-        logger.info("Collection created with symbol/regime/ts indexes.")
+        logger.info(f"Collection {self.collection_name} created with symbol/regime/ts indexes.")
 
     # ------------------------------------------------------------------
     def upsert_batch(self, df: pd.DataFrame, vectors: np.ndarray):
@@ -87,7 +86,7 @@ class QdrantMemory:
 
         for i in range(0, len(points), 100):
             self.client.upsert(self.collection_name, points[i:i + 100])
-        logger.info(f"Upserted {len(points)} vectors into Qdrant.")
+        logger.info(f"Upserted {len(points)} vectors into Qdrant ({self.collection_name}).")
 
     # ------------------------------------------------------------------
     def search_similar(self, vector: np.ndarray, symbol: str = None, limit: int = 10,
