@@ -6,8 +6,16 @@ DB-backed symbol universe with Alpaca verification.
 - add_symbol() verifies against Alpaca before activating.
 - Falls back to config.symbols if the DB is unreachable, so the trader
   never dies because the universe table is missing.
+
+CLI:
+  python -m src.universe.symbol_manager                  # list all
+  python -m src.universe.symbol_manager add NVDA stock
+  python -m src.universe.symbol_manager add BTC/USD crypto
+  python -m src.universe.symbol_manager remove GOOGL stock
+  python -m src.universe.symbol_manager verify TSLA stock
 """
 import os
+import sys
 import psycopg2
 from config.settings import config
 from src.utils.logger import setup_logger
@@ -104,5 +112,22 @@ class SymbolManager:
 
 if __name__ == "__main__":
     mgr = SymbolManager()
-    for row in mgr.list_symbols():
-        print(row)
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else 'list'
+
+    if cmd == 'add' and len(sys.argv) >= 3:
+        sym = sys.argv[2]
+        typ = sys.argv[3] if len(sys.argv) > 3 else 'stock'
+        ok = mgr.add_symbol(sym, typ)
+        print(f"{'OK' if ok else 'FAILED'}: add {sym.upper()} ({typ})")
+    elif cmd in ('remove', 'rm') and len(sys.argv) >= 3:
+        sym = sys.argv[2]
+        typ = sys.argv[3] if len(sys.argv) > 3 else 'stock'
+        ok = mgr.remove_symbol(sym, typ)
+        print(f"{'OK' if ok else 'FAILED'}: remove {sym.upper()} ({typ})")
+    elif cmd == 'verify' and len(sys.argv) >= 3:
+        sym = sys.argv[2]
+        typ = sys.argv[3] if len(sys.argv) > 3 else 'stock'
+        print(f"{sym.upper()}: tradable={SymbolManager.verify_on_alpaca(sym, typ)}")
+    else:
+        for row in mgr.list_symbols():
+            print(row)

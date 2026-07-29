@@ -12,6 +12,9 @@ Favorability score (0..1) per symbol:
   10%  liquidity               - current volume vs its own average
   10%  news sentiment          - real FinBERT (if available)
 
+Timeframe-aware: reads market_data{BAR_SUFFIX}/feature_cache{BAR_SUFFIX}
+so the selector scores symbols on the same 1h states the brain trades.
+
 Run:  python -m src.universe.selector            (select + persist today)
 """
 import numpy as np
@@ -27,8 +30,9 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("DailySelector", "logs/universe.log")
 
-# Volatility sweet spot for 5-min trading (ATR as % of price)
-ATR_PCT_MIN, ATR_PCT_MAX = 0.0015, 0.030
+# Volatility sweet spot (ATR as % of price), config-driven
+ATR_PCT_MIN = getattr(config, 'SELECTOR_ATR_PCT_MIN', 0.0015)
+ATR_PCT_MAX = getattr(config, 'SELECTOR_ATR_PCT_MAX', 0.030)
 
 
 class DailySelector:
@@ -39,15 +43,16 @@ class DailySelector:
 
     # ------------------------------------------------------------------
     def _recent_row(self, symbol: str) -> pd.Series | None:
-        """Latest feature row for a symbol from the DB."""
+        """Latest feature row for a symbol from the active-timeframe DB tables."""
         try:
+            suffix = config.BAR_SUFFIX
             conn = psycopg2.connect(config.database.url)
-            df = pd.read_sql("""
+            df = pd.read_sql(f"""
                 SELECT m.time_bucket AS timestamp, m.open, m.high, m.low, m.close, m.volume,
                        f.rsi_14, f.atr_14, f.atr_pct, f.adx_14, f.regime_label,
                        f.volume_profile_ratio, f.sentiment_score
-                FROM market_data m
-                JOIN feature_cache f ON m.symbol = f.symbol AND m.time_bucket = f.time_bucket
+                FROM market_data{suffix} m
+                JOIN feature_cache{suffix} f ON m.symbol = f.symbol AND m.time_bucket = f.time_bucket
                 WHERE m.symbol = %s
                 ORDER BY m.time_bucket DESC LIMIT 250
             """, conn, params=(symbol,))
