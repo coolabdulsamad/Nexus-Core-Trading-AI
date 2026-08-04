@@ -61,9 +61,10 @@ class PolygonFetcher:
         logger.info(f"Fetching crypto {symbol} as {ticker}")
         return self.fetch_historical_bars(ticker, start_date, end_date, timespan, multiplier)
 
-    def fetch_latest_intraday(self, symbol: str, multiplier: int = 5) -> pd.DataFrame:
+    def fetch_latest_intraday(self, symbol: str, multiplier: int = 5,
+                              days: int = 7) -> pd.DataFrame:
         end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
         return self.fetch_historical_bars(symbol, start_date, end_date, "minute", multiplier)
 
 

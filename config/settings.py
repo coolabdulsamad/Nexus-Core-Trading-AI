@@ -10,8 +10,14 @@ management. Hourly bars cut trade frequency ~12x, shrink costs relative
 to moves, and make recalled states actually comparable.
 
 PR2: symbol universe (DB-backed, Alpaca-verified), daily top-N selection,
-crypto support. This file merges the PR2 additions onto main's v3 config
-(so the PR merges without conflicts).
+crypto support.
+
+v3.1: UNIVERSE_POOL - the full candidate watchlist seeded into the DB
+(python -m src.universe.seed_universe). Edge is symbol-specific and
+time-specific, so the system watches a wide pool and lets the quality
+gate decide what actually trades. The data/memory pipeline scripts are
+DB-driven (every symbol in the DB gets backfilled, resampled, encoded),
+so `symbols` below is now only the offline fallback.
 """
 import os
 from dotenv import load_dotenv
@@ -39,13 +45,38 @@ class GlobalConfig:
     polygon = PolygonSettings()
 
     # ----- Universe -----
-    symbols = ["AAPL", "TSLA", "MSFT", "GOOGL", "NVDA"]
+    symbols = ["AAPL", "TSLA", "MSFT", "GOOGL", "NVDA"]   # offline fallback only
     BAR_MINUTES = 60                     # v3: 1-hour bars (60) or 5-min (5)
     BAR_SUFFIX = "_1h" if BAR_MINUTES == 60 else ""   # DB table suffix
 
+    # ----- Candidate pool (v3.1) -----
+    # Seeded into the DB universe by src/universe/seed_universe.py
+    # (each name is Alpaca-verified before activation). In 'manual' mode
+    # the trader watches EVERY active symbol and the quality gate decides
+    # what trades; in 'auto' mode the DailySelector ranks the pool and
+    # trades the top N. Liquid, diverse, all Alpaca-tradable.
+    UNIVERSE_POOL = [
+        # mega-cap tech / semis
+        "AAPL", "MSFT", "GOOGL", "NVDA", "TSLA", "AMZN", "META",
+        "AMD", "AVGO", "NFLX", "CRM", "ORCL", "ADBE", "QCOM",
+        "INTC", "MU", "PLTR",
+        # financials
+        "JPM", "BAC", "GS", "V", "MA",
+        # energy
+        "XOM", "CVX",
+        # healthcare
+        "UNH", "JNJ", "LLY", "PFE",
+        # consumer
+        "HD", "MCD", "NKE", "SBUX", "DIS",
+        # industrials
+        "BA", "CAT",
+        # high-beta / crypto proxies
+        "COIN", "MSTR",
+    ]
+
     # ----- Universe management (PR2) -----
-    UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "manual")   # 'manual' (DB active list) | 'auto' (daily selector)
-    TOP_N_SYMBOLS = 5                    # how many symbols the selector trades per day
+    UNIVERSE_MODE = os.getenv("UNIVERSE_MODE", "manual")   # 'manual' = watch ALL active symbols | 'auto' = selector top-N daily
+    TOP_N_SYMBOLS = 5                    # how many symbols the selector trades per day (auto mode)
     CRYPTO_ENABLED = True
     CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
     SELECTOR_ATR_PCT_MIN = 0.0015        # volatility fit floor for the daily selector

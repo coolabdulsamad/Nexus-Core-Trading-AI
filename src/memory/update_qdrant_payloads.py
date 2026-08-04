@@ -5,9 +5,10 @@ Syncs realised forward returns (1h + active horizon) + regime labels from
 TimescaleDB into Qdrant.
 
 - Timeframe-aware: reads market_data{BAR_SUFFIX}/feature_cache{BAR_SUFFIX}.
+- v3.1: covers EVERY symbol present in the feature table (DB-driven), so
+  newly added symbols get payloads without config edits.
 - Targets EXACTLY the rows that were encoded into Qdrant (same JOIN,
-  same symbol filter, same vwap/close not-null rule as the encoder), so
-  point ids match 1:1.
+  same vwap/close not-null rule as the encoder), so point ids match 1:1.
 - Sends updates in BATCHES via batch_update_points (one HTTP round trip
   per 100 points instead of one per point).
 
@@ -31,9 +32,13 @@ def main():
     suffix = config.BAR_SUFFIX
     collection = f"market_memory_{config.BAR_MINUTES}m"
     logger.info(f"===== QDRANT PAYLOAD UPDATE (collection: {collection}, key: {HORIZON_KEY}) =====")
-    symbols = list(config.symbols)
 
     conn = psycopg2.connect(config.database.url)
+    symbols = pd.read_sql(
+        f"SELECT DISTINCT symbol FROM feature_cache{suffix} ORDER BY symbol",
+        conn)['symbol'].tolist()
+    logger.info(f"Syncing payloads for symbols: {symbols}")
+
     df = pd.read_sql(
         f"""
         SELECT f.symbol, f.time_bucket, f.forward_return_1h, f.forward_return_4h,

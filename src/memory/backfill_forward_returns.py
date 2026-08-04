@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-src/memory/backfill_forward_returns.py  (v2.2)
+src/memory/backfill_forward_returns.py  (v2.2, LEGACY 5-min)
+
+v3 NOTE: this script targets the 5-min base tables (market_data /
+feature_cache). The 1h layer computes its own forward returns inside
+resample_to_1h / backfill_crypto / run_pump, so v3 (1h) rebuilds do NOT
+need this script - run update_qdrant_payloads directly after build_memory.
+
 Calculates realised forward returns for every historical bar at BOTH
 horizons: 1h (reference) and the active prediction horizon
 (config.FORWARD_HORIZON_HOURS, default 4h).

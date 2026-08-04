@@ -8,6 +8,10 @@ columns stay in the DB but are NOT used in the vector.
 
 v3: timeframe-aware - reads market_data{BAR_SUFFIX} / feature_cache{BAR_SUFFIX}
 so the same encoder serves 5-min and 1h data layers.
+
+v3.1: fetch_all_features() with no arguments now covers EVERY symbol
+present in the feature table (DB-driven), so symbols added through the
+universe manager flow into memory without config edits.
 """
 import os
 import joblib
@@ -53,10 +57,13 @@ class VectorEncoder:
 
     # ------------------------------------------------------------------
     def fetch_all_features(self, symbols=None) -> pd.DataFrame:
-        if symbols is None:
-            symbols = config.symbols
-
         suffix = config.BAR_SUFFIX
+        if symbols is None:
+            symbols = pd.read_sql(
+                f"SELECT DISTINCT symbol FROM feature_cache{suffix} ORDER BY symbol",
+                self.conn)['symbol'].tolist()
+            logger.info(f"Encoding ALL symbols in feature_cache{suffix}: {symbols}")
+
         query = f"""
             SELECT f.*, m.close, m.vwap
             FROM feature_cache{suffix} f
