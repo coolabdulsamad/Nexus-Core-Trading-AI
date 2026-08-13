@@ -20,11 +20,27 @@ v3.0.1 fixes:
   window server-side and tails client-side.
 - _send_eod / _send_heartbeat: corrected to reporter.py's actual
   signatures (trade dict list + day_start/peak equity).
+
+v3.2 (the "zero trades" post-mortem):
+- enter_position/manage_exit computed the v2 indicator set on a 60-bar
+  window; calculate_all_indicators() dropna()s the 200-bar warm-up, so the
+  frame came back EMPTY and every entry (plus all ATR-based exit logic,
+  including stop-loss checks) silently aborted. Both now use the full bar
+  window. This bug blocked 100% of entries since v3 launched.
+- manage_exit: hard SL/TP now checked BEFORE any indicator dependency, so
+  positions stay protected even during data hiccups.
+- Trend filter: hard 200-SMA veto -> regime-aware. Counter-trend signals
+  pass with a quality penalty (x0.7) when the short-term regime does not
+  oppose them; only fighting BOTH timeframes stays vetoed.
+- Crypto is long-only (Alpaca spot has no shorting): crypto SELL signals
+  are logged and skipped instead of attempting impossible orders.
+- Every bail in the entry path now logs its reason.
 """
 import os
 import sys
 import time
 import logging
+import re
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -74,6 +90,13 @@ TRAILING_STOP_DISTANCE = 6.0      # ATR behind price
 TRAILING_STOP_ENABLED = True
 
 MAX_SPREAD_PCT = 0.002
+
+# ----- Counter-trend entries (v3.2) -----
+# The brain is mean-reverting: at highs it often says SELL while price is
+# still above the 200-bar average. A hard veto there blocked every entry
+# for weeks. Counter-trend signals now pass at reduced quality UNLESS the
+# short-term regime also disagrees (fighting both timeframes stays banned).
+COUNTER_TREND_PENALTY = 0.7
 
 ATR_SMA_PERIOD = 50
 
@@ -440,32 +463,79 @@ class MultiSymbolPaperTrader:
         if sma is None or np.isnan(sma):
             return None, 0.0, 'no_sma'
 
+        regime = ''
+        m = re.search(r'regime=(\w+)', reason or '')
+        if m:
+            regime = m.group(1)
+
+        # With-trend entries: unchanged
         if signal == 'BUY' and price > sma:
             return 'LONG', quality, reason
         if signal == 'SELL' and price < sma:
+            if self._is_crypto(symbol):
+                logger.info(f"{symbol} | SELL q={quality:.3f} skipped: crypto is long-only on Alpaca spot")
+                return None, quality, reason
             return 'SHORT', quality, reason
+
+        # Counter-trend (v3.2): allowed at reduced quality UNLESS the
+        # short-term regime also disagrees (fighting both timeframes = veto).
+        if signal in ('BUY', 'SELL') and quality >= config.MIN_SIGNAL_QUALITY:
+            opposed = ((signal == 'SELL' and regime == 'trend_up') or
+                       (signal == 'BUY' and regime == 'trend_down'))
+            relation = 'above' if price > sma else 'below'
+            if opposed:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: fights both timeframes "
+                            f"(price {relation} 200-bar avg, regime={regime or 'unknown'})")
+                return None, quality, reason
+            adj = quality * COUNTER_TREND_PENALTY
+            if adj < config.MIN_SIGNAL_QUALITY:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: counter-trend penalty "
+                            f"-> effective q={adj:.3f} below gate {config.MIN_SIGNAL_QUALITY:.2f}")
+                return None, quality, reason
+            if signal == 'SELL' and self._is_crypto(symbol):
+                logger.info(f"{symbol} | SELL q={quality:.3f} skipped: crypto is long-only on Alpaca spot")
+                return None, quality, reason
+            side = 'LONG' if signal == 'BUY' else 'SHORT'
+            logger.info(f"{symbol} | {signal} q={quality:.3f} counter-trend ALLOWED "
+                        f"(penalty x{COUNTER_TREND_PENALTY} -> effective q={adj:.3f}, regime={regime or 'unknown'})")
+            return side, adj, reason
         return None, quality, reason
 
     def enter_position(self, symbol: str, side: str, quality: float):
-        df = self.get_bars(symbol, limit=60)
+        # Full bar window: calculate_all_indicators() dropna()s the 200-bar
+        # warm-up, so a short window returns an EMPTY frame (the v3.2 bug
+        # that silently killed every entry).
+        df = self.get_bars(symbol)
         if df is None or df.empty:
+            logger.warning(f"{symbol} entry aborted: bar fetch failed")
             return
         price = self.get_latest_price(symbol)
         feats = calculate_all_indicators(
             df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy())
-        if price is None or feats.empty:
+        if price is None:
+            logger.warning(f"{symbol} entry aborted: no latest price")
+            return
+        if feats.empty:
+            logger.warning(f"{symbol} entry aborted: indicator set empty after warm-up drop")
             return
         atr = float(feats.iloc[-1]['atr_14'])
-        if atr <= 0 or not self._spread_ok(symbol, price):
+        if atr <= 0 or np.isnan(atr):
+            logger.warning(f"{symbol} entry aborted: invalid ATR ({atr})")
+            return
+        if not self._spread_ok(symbol, price):
+            logger.info(f"{symbol} entry skipped: spread wider than {MAX_SPREAD_PCT:.1%}")
             return
 
         qty = self.calculate_position_size(symbol, price, atr, quality)
         if qty <= 0:
+            logger.warning(f"{symbol} entry aborted: size rounds to {qty} "
+                           f"(price={price:.2f} atr={atr:.2f} q={quality:.3f})")
             return
 
         if not self._is_crypto(symbol):
             open_positions = sum(1 for s in self.all_symbols if self.in_position[s])
             if open_positions >= MAX_POSITIONS:
+                logger.info(f"{symbol} entry skipped: MAX_POSITIONS={MAX_POSITIONS} reached")
                 return
 
         order_side = OrderSide.BUY if side == 'LONG' else OrderSide.SELL
@@ -514,14 +584,28 @@ class MultiSymbolPaperTrader:
             self._reset_position_state(symbol)
             return None
 
-        df = self.get_bars(symbol, limit=60)
+        # 1) Hard stop / take profit — checked BEFORE anything data-dependent,
+        #    so a position is never left unprotected by an indicator hiccup.
+        if side == 'LONG':
+            if price <= self.stop_loss[symbol]:
+                return 'STOP_LOSS'
+            if price >= self.take_profit[symbol]:
+                return 'TAKE_PROFIT'
+        else:
+            if price >= self.stop_loss[symbol]:
+                return 'STOP_LOSS'
+            if price <= self.take_profit[symbol]:
+                return 'TAKE_PROFIT'
+
+        df = self.get_bars(symbol)   # full window: indicator dropna() needs 200+ bars
         atr = None
         if df is not None and not df.empty:
             feats = calculate_all_indicators(
                 df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy())
             if not feats.empty:
                 atr = float(feats.iloc[-1]['atr_14'])
-        if not atr or atr <= 0:
+        if atr is None or atr <= 0 or np.isnan(atr):
+            logger.warning(f"{symbol} exit mgmt skipped: ATR unavailable (hard SL/TP still active)")
             return None
 
         self.highest_price[symbol] = max(self.highest_price[symbol], price)
@@ -533,18 +617,6 @@ class MultiSymbolPaperTrader:
         else:
             atr_profit = (entry - price) / atr
             peak_profit = (entry - self.lowest_price[symbol]) / atr
-
-        # 1) Hard stop / take profit
-        if side == 'LONG':
-            if price <= self.stop_loss[symbol]:
-                return 'STOP_LOSS'
-            if price >= self.take_profit[symbol]:
-                return 'TAKE_PROFIT'
-        else:
-            if price >= self.stop_loss[symbol]:
-                return 'STOP_LOSS'
-            if price <= self.take_profit[symbol]:
-                return 'TAKE_PROFIT'
 
         # 2) Breakeven lock
         if not self.breakeven_set[symbol] and atr_profit >= BREAKEVEN_ATR:
