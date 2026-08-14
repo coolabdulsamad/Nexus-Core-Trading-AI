@@ -10,6 +10,10 @@ Honest backtesting:
 - sma_cross exit disabled (structurally guaranteed-loss).
 - v3: timeframe-aware - reads market_data{BAR_SUFFIX}/feature_cache{BAR_SUFFIX}
   and annualizes Sharpe with the correct bars-per-day for the timeframe.
+- v3.2: entry rule now matches the live trader - counter-trend signals pass
+  with a quality penalty (x0.7) UNLESS the regime also opposes them (fighting
+  both timeframes stays vetoed); crypto is long-only. A per-bar decision
+  funnel is printed so "0 trades" always explains itself.
 """
 import psycopg2
 import pandas as pd
@@ -24,6 +28,7 @@ logger = setup_logger("BacktesterEngine", "logs/backtester.log")
 
 BAR_SECONDS = config.BAR_MINUTES * 60
 BARS_PER_DAY = 390 / config.BAR_MINUTES          # 78 at 5-min, 6.5 at 1h
+COUNTER_TREND_PENALTY = 0.7   # same rule as the live trader (v3.2)
 
 
 class BacktesterEngine:
@@ -38,6 +43,11 @@ class BacktesterEngine:
         self.meta_learner = MetaLearner()
         self.df = None
         self.cooldown = 0
+        self.funnel = dict(bars=0, buy=0, sell=0, hold=0, thin_memory=0,
+                           counter_trend_allowed=0, blocked_trend_opposed=0,
+                           blocked_crypto_short=0, blocked_conviction=0,
+                           blocked_volatility=0, blocked_quality=0,
+                           blocked_daily_guard=0, blocked_size=0, entries=0)
 
     def fetch_data(self) -> pd.DataFrame:
         suffix = config.BAR_SUFFIX
@@ -120,27 +130,63 @@ class BacktesterEngine:
             signal, prob = result['signal'], result['confidence']
             quality = result.get('quality', 0.0)
 
+            # 3b. Decision funnel accounting (v3.2: every bar is explained)
+            self.funnel['bars'] += 1
+            self.funnel[signal.lower()] += 1
+            if 'thin_memory' in str(result.get('reason', '')):
+                self.funnel['thin_memory'] += 1
+
             # 4. Gates
             vol_ok = True
             if config.VOLATILITY_FILTER_ENABLED:
                 vol_ok = row['volatility_ratio'] < config.VOLATILITY_RATIO_MAX
             conviction_ok = abs(prob - 0.5) >= config.ENTRY_CONVICTION_MARGIN
-            quality_ok = quality >= config.MIN_SIGNAL_QUALITY
             can_trade, day_reason = self.risk.can_open_new_position(equity)
 
-            # 5. Entry (flat only)
+            # 5. Entry (flat only) - v3.2 regime-aware trend rule (same as live)
             if len(self.broker.open_positions) == 0:
-                if vol_ok and conviction_ok and quality_ok and can_trade:
-                    if signal == 'BUY' and price > row['sma_200']:
-                        size, sl, tp = self.risk.size_with_tier(price, atr, quality, 'LONG')[:3]
+                proceed = signal in ('BUY', 'SELL')
+                eff_quality = quality
+                if proceed:
+                    sma = row['sma_200']
+                    with_trend = ((signal == 'BUY' and price > sma) or
+                                  (signal == 'SELL' and price < sma))
+                    if not with_trend:
+                        regime = row.get('regime_label')
+                        regime = regime if isinstance(regime, str) and regime else 'unknown'
+                        opposed = ((signal == 'SELL' and regime == 'trend_up') or
+                                   (signal == 'BUY' and regime == 'trend_down'))
+                        if opposed:
+                            self.funnel['blocked_trend_opposed'] += 1
+                            proceed = False
+                        else:
+                            eff_quality = quality * COUNTER_TREND_PENALTY
+                            if eff_quality >= config.MIN_SIGNAL_QUALITY:
+                                self.funnel['counter_trend_allowed'] += 1
+                    if proceed and signal == 'SELL' and '/' in self.symbol:
+                        self.funnel['blocked_crypto_short'] += 1
+                        proceed = False
+                if proceed:
+                    if not conviction_ok:
+                        self.funnel['blocked_conviction'] += 1
+                    elif not vol_ok:
+                        self.funnel['blocked_volatility'] += 1
+                    elif eff_quality < config.MIN_SIGNAL_QUALITY:
+                        self.funnel['blocked_quality'] += 1
+                    elif not can_trade:
+                        self.funnel['blocked_daily_guard'] += 1
+                    else:
+                        side = 'LONG' if signal == 'BUY' else 'SHORT'
+                        size, sl, tp = self.risk.size_with_tier(price, atr, eff_quality, side)[:3]
                         if size > 0:
-                            self.broker.open_long(t, self.risk.apply_slippage(price, True), size, sl, tp)
-                            logger.info(f"BUY ({result.get('reason','')}) q={quality}")
-                    elif signal == 'SELL' and price < row['sma_200']:
-                        size, sl, tp = self.risk.size_with_tier(price, atr, quality, 'SHORT')[:3]
-                        if size > 0:
-                            self.broker.open_short(t, self.risk.apply_slippage(price, True), size, sl, tp)
-                            logger.info(f"SELL ({result.get('reason','')}) q={quality}")
+                            if side == 'LONG':
+                                self.broker.open_long(t, self.risk.apply_slippage(price, True), size, sl, tp)
+                            else:
+                                self.broker.open_short(t, self.risk.apply_slippage(price, True), size, sl, tp)
+                            self.funnel['entries'] += 1
+                            logger.info(f"{signal} ({result.get('reason','')}) q={quality:.3f} eff={eff_quality:.3f}")
+                        else:
+                            self.funnel['blocked_size'] += 1
             else:
                 # 6. Exit management
                 pos = self.broker.open_positions[0]
@@ -215,6 +261,16 @@ class BacktesterEngine:
         print(f"Sharpe:         {sharpe:.2f}   Max Drawdown: {max_dd:.2f}%")
         print("-" * 60)
         print(f"Trades: {len(trades)}   Win rate: {win_rate:.1f}%   W/L: {len(wins)}/{len(losses)}")
+        print("-" * 60)
+        print("DECISION FUNNEL (why bars did/didn't trade):")
+        f = self.funnel
+        print(f"  Bars evaluated:         {f['bars']:<6} BUY={f['buy']} SELL={f['sell']} HOLD={f['hold']}")
+        print(f"  Memory thin/missing:    {f['thin_memory']:<6} (if this equals bars, Qdrant/memory is DOWN)")
+        print(f"  Entries taken:          {f['entries']:<6} (counter-trend allowed: {f['counter_trend_allowed']})")
+        print(f"  Blocked by quality:     {f['blocked_quality']:<6} (incl. counter-trend x{COUNTER_TREND_PENALTY} penalty)")
+        print(f"  Blocked trend-opposed:  {f['blocked_trend_opposed']:<6} (signal fights BOTH timeframes)")
+        print(f"  Blocked conviction:     {f['blocked_conviction']:<6} Blocked volatility: {f['blocked_volatility']}")
+        print(f"  Blocked daily-guard:    {f['blocked_daily_guard']:<6} Blocked size: {f['blocked_size']}  Crypto shorts skipped: {f['blocked_crypto_short']}")
         if trades:
             avg_w = np.mean([t['pnl'] for t in wins]) if wins else 0
             avg_l = np.mean([t['pnl'] for t in losses]) if losses else 0
