@@ -48,6 +48,21 @@ v3.4 (position adoption + honest sizing):
   capped at CAPITAL_PER_SYMBOL) and every entry is capped by live buying
   power. The old fixed $100k/symbol slice could deploy ~3x the account,
   which is how the paper account ended up at -$206k cash.
+
+v3.5 (single-instance lock + close-race guard + crypto cash fix):
+- A file lock (logs/.trader.lock) makes a second concurrent trader process
+  REFUSE to start. Two instances on one account were fighting each other:
+  one's close became the other's new short, positions doubled round after
+  round (INTC 52 -> 4032 shares) and closes started failing with
+  "insufficient buying power" (Alpaca treats a sell beyond the held qty as
+  opening a short, which needs margin).
+- close_position re-reads the live broker qty immediately before selling
+  and caps the close at what is actually held, so a close can never
+  overshoot into a short even in a race.
+- Crypto entries are now capped by non_marginable_buying_power (settled
+  USD), not the margin buying_power field - Alpaca crypto is
+  non-marginable, so the old cap let unfillable orders through and spammed
+  "insufficient balance for USD" every cycle.
 """
 import os
 import sys
@@ -59,6 +74,11 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None   # non-Linux: single-instance lock disabled (warned at startup)
 
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
@@ -157,9 +177,26 @@ SLICE_PCT_OF_EQUITY = getattr(config, 'SLICE_PCT_OF_EQUITY', 0.33)
 BUYING_POWER_USAGE_CAP = getattr(config, 'BUYING_POWER_USAGE_CAP', 0.95)
 ADOPT_FALLBACK_SL_PCT = 0.05           # emergency bracket if ATR is unavailable at adoption
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 class MultiSymbolPaperTrader:
     def __init__(self):
+        # Single-instance lock (v3.5): two trader processes on one account
+        # trade AGAINST each other (one's close becomes the other's short).
+        # Refuse to start if another instance already holds the lock.
+        if fcntl is not None:
+            self._lock_fh = open(os.path.join(PROJECT_ROOT, "logs", ".trader.lock"), "a")
+            try:
+                fcntl.flock(self._lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                logger.error("Another trader instance is already running - refusing to start")
+                send_telegram("Trader NOT started: another instance is already running. "
+                              "Kill all trader processes first (tmux kill-server).", 'warning')
+                sys.exit(1)
+        else:
+            logger.warning("fcntl unavailable - single-instance lock disabled")
+
         self.trading_client = TradingClient(API_KEY, API_SECRET, paper=PAPER)
         self.stock_data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
         self.crypto_data_client = CryptoHistoricalDataClient(API_KEY, API_SECRET)
@@ -409,7 +446,13 @@ class MultiSymbolPaperTrader:
             return False
 
     def close_position(self, symbol: str, qty: float, reason: str) -> bool:
+        # Re-read the live broker qty right before selling so a close can
+        # NEVER overshoot into a short (v3.5 race protection).
+        live_qty = abs(self.get_position_qty(symbol))
+        qty = min(qty, live_qty)
         if qty <= 0:
+            logger.info(f"{symbol} close ({reason}): broker already flat - clearing state")
+            self._reset_position_state(symbol)
             return False
         side = OrderSide.SELL if self.position_side[symbol] == 'LONG' else OrderSide.BUY
         self.cancel_symbol_orders(symbol)
@@ -562,9 +605,16 @@ class MultiSymbolPaperTrader:
         if USE_REAL_ACCOUNT_SIZING:
             # Hard cap: one entry may never use more than X% of LIVE buying
             # power. This is what stops the account from going leveraged
-            # (cash negative) again.
+            # (cash negative) again. Crypto on Alpaca is NON-marginable:
+            # it is limited by settled USD (non_marginable_buying_power),
+            # not the margin buying_power field.
             try:
-                bp = float(self.get_account().buying_power)
+                acct = self.get_account()
+                nmbp = getattr(acct, 'non_marginable_buying_power', None)
+                if self._is_crypto(symbol) and nmbp is not None:
+                    bp = float(nmbp)
+                else:
+                    bp = float(acct.buying_power)
                 max_qty_bp = (bp * BUYING_POWER_USAGE_CAP) / price
                 if max_qty_bp < qty:
                     logger.info(f"{symbol} size capped by live buying power ${bp:,.0f}")
@@ -969,13 +1019,11 @@ class MultiSymbolPaperTrader:
         # Due? Launch `python -m src.maintenance` in the background
         if datetime.now(timezone.utc) >= self._next_maintenance:
             try:
-                project_root = os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.abspath(__file__))))
-                log_path = os.path.join(project_root, "logs", "maintenance.log")
+                log_path = os.path.join(PROJECT_ROOT, "logs", "maintenance.log")
                 fh = open(log_path, "a")
                 self._maintenance_proc = subprocess.Popen(
                     [sys.executable, "-m", "src.maintenance"],
-                    cwd=project_root, stdout=fh, stderr=subprocess.STDOUT,
+                    cwd=PROJECT_ROOT, stdout=fh, stderr=subprocess.STDOUT,
                 )
                 fh.close()   # child holds its own fd
                 logger.info(f"Daily maintenance launched in background (pid {self._maintenance_proc.pid})")
