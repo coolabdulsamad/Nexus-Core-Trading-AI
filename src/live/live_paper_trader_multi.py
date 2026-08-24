@@ -63,6 +63,11 @@ v3.5 (single-instance lock + close-race guard + crypto cash fix):
   USD), not the margin buying_power field - Alpaca crypto is
   non-marginable, so the old cap let unfillable orders through and spammed
   "insufficient balance for USD" every cycle.
+
+v3.5.1: the per-cycle reconcile now also detects a SIDE FLIP (broker holds
+the opposite side of what we track - e.g. a leftover short from the
+two-process fight while we adopted a long) and re-adopts from the broker's
+real side instead of managing it with a backwards bracket.
 """
 import os
 import sys
@@ -518,7 +523,22 @@ class MultiSymbolPaperTrader:
                 self.all_symbols.append(symbol)
                 logger.info(f"Broker position in off-universe {symbol} - tracking for management only")
             if self.in_position.get(symbol):
-                continue                      # already tracked - leave it alone
+                # Side-flip guard (v3.5.1): the broker may hold the OPPOSITE
+                # side of what we track (e.g. a leftover short from the
+                # two-process fight while we adopted a long). Managing it
+                # with the wrong side makes every exit do the reverse of the
+                # right thing, so re-adopt from the broker's truth.
+                broker_side = 'LONG' if signed_qty > 0 else 'SHORT'
+                if self.position_side.get(symbol) != broker_side:
+                    logger.warning(f"{symbol} side mismatch: tracking {self.position_side.get(symbol)} "
+                                   f"but broker holds {broker_side} - re-adopting from broker state")
+                    send_telegram(
+                        f"{symbol} side mismatch fixed: broker holds {broker_side} "
+                        f"{abs(signed_qty)} @ ${avg_entry:.2f} - bracket rebuilt for {broker_side}.",
+                        'warning')
+                    self._reset_position_state(symbol)
+                    self._adopt_position(symbol, signed_qty, avg_entry)
+                continue                      # tracked and same side - leave it alone
             self._adopt_position(symbol, signed_qty, avg_entry)
 
         # 2) clear positions the broker no longer holds
