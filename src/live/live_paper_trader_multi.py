@@ -68,6 +68,30 @@ v3.5.1: the per-cycle reconcile now also detects a SIDE FLIP (broker holds
 the opposite side of what we track - e.g. a leftover short from the
 two-process fight while we adopted a long) and re-adopts from the broker's
 real side instead of managing it with a backwards bracket.
+
+v3.5.2 (the PLTR pile-up post-mortem, Aug 26):
+- close_position now derives the close direction from the BROKER's live
+  signed qty, not from tracked state. Tracked state was briefly wrong
+  during the pile-up, which turned "closes" into orders in the wrong
+  direction; that class of bug is now impossible by construction.
+- Close fallback: if a market-order close is rejected twice (e.g.
+  "insufficient buying power" when Alpaca sees the shares tied up by a
+  foreign order), cancel resting orders and use Alpaca's server-side
+  position liquidation, which is side- and qty-agnostic. 3+ failures send
+  an urgent Telegram instead of retrying silently for hours.
+- Reconcile now checks SIZE as well as side: if the broker qty changed
+  without any order from this process, it re-syncs to the broker size and
+  raises a loud "second trader" alert. The old side-only check watched
+  PLTR double 55 -> 110 -> 330 -> 660 -> 1320 and saw nothing wrong.
+- Runaway-size circuit breaker: a position bigger than 2x its sizing
+  slice cannot have come from this strategy; the bot alerts and refuses
+  to add more.
+- Partial closes (partial TP / time partial) now re-sync the tracked qty
+  from the broker right after filling, so later size checks stay honest.
+- Entry: post-fill verification checks the resulting SIDE as well as the
+  qty; a rejected entry with "insufficient" now backs off for 30 min
+  instead of spamming a failing order every 5 minutes.
+- The stale-data warning now names the symbol.
 """
 import os
 import sys
@@ -164,6 +188,14 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
+TRADER_VERSION = "v3.5.2"
+
+# Ghost-trader / runaway detection (v3.5.2)
+SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
+RUNAWAY_NOTIONAL_MULT = 2.0       # position > 2x its sizing slice => impossible from us
+RUNAWAY_ALERT_SECONDS = 3600      # throttle runaway/ghost alerts per symbol
+ENTRY_FAIL_COOLDOWN_CYCLES = 6    # 30 min backoff after an "insufficient" rejection
+
 EOD_REPORT_ENABLED = config.TELEGRAM_EOD_REPORT
 HEARTBEAT_CYCLES = config.TELEGRAM_HEARTBEAT_CYCLES
 
@@ -236,6 +268,11 @@ class MultiSymbolPaperTrader:
         self.daily_target_hit = {s: False for s in self.all_symbols}
         self.time_partial_done = {s: False for s in self.all_symbols}
         self.active_orders: Dict[str, str] = {}
+        self.close_fail_count = {s: 0 for s in self.all_symbols}
+        self.last_order_error: Dict[str, str] = {}
+        self._ghost_alerted: Dict[str, float] = {}
+        self._runaway_alerted: Dict[str, float] = {}
+        self._last_equity = 0.0
 
         self.last_report_date = None
         self.cycle_count = 0
@@ -327,6 +364,7 @@ class MultiSymbolPaperTrader:
         self.daily_start_equity[s] = None
         self.daily_realized_pnl[s] = 0.0
         self.daily_target_hit[s] = False
+        self.close_fail_count[s] = 0
 
     # ================= Market data =================
     def _get_data_client(self, symbol: str):
@@ -361,7 +399,7 @@ class MultiSymbolPaperTrader:
             return None
         return float(df.iloc[-1]['close'])
 
-    def compute_indicators(self, df: pd.DataFrame) -> Optional[pd.Series]:
+    def compute_indicators(self, df: pd.DataFrame, symbol: str = '?') -> Optional[pd.Series]:
         """Latest CLOSED bar with the full v2 indicator set (same as backtester)."""
         try:
             if len(df) < SMA_PERIOD + 5:
@@ -383,7 +421,7 @@ class MultiSymbolPaperTrader:
                 latest['sma_200'] = df['close'].rolling(SMA_PERIOD).mean().iloc[-2]
             bar_age = (pd.Timestamp.now(tz='UTC') - pd.Timestamp(latest['timestamp'])).total_seconds()
             if bar_age > MAX_DATA_AGE_SECONDS:
-                logger.warning(f"Stale data ({bar_age/3600:.1f}h old), skipping cycle")
+                logger.warning(f"{symbol}: stale data ({bar_age/3600:.1f}h old), skipping cycle")
                 return None
             return latest
         except Exception as e:
@@ -445,36 +483,76 @@ class MultiSymbolPaperTrader:
                 logger.error(f"{symbol} {order_type_label} NOT FILLED")
                 return False
             logger.info(f"{symbol} {order_type_label} filled: {qty} {side.value}")
+            self.last_order_error.pop(symbol, None)
             return True
         except Exception as e:
+            self.last_order_error[symbol] = str(e)
             logger.error(f"{symbol} {order_type_label} failed: {e}")
             return False
 
     def close_position(self, symbol: str, qty: float, reason: str) -> bool:
-        # Re-read the live broker qty right before selling so a close can
-        # NEVER overshoot into a short (v3.5 race protection).
-        live_qty = abs(self.get_position_qty(symbol))
-        qty = min(qty, live_qty)
-        if qty <= 0:
+        # v3.5.2: the close direction comes from the BROKER's live signed
+        # qty, never from tracked state. During the PLTR pile-up the tracked
+        # side was briefly wrong, which turned "closes" into orders in the
+        # wrong direction - that class of bug is now impossible by
+        # construction. Qty is still capped at what the broker actually
+        # holds (v3.5), so a close can never overshoot into a short.
+        signed = self.get_position_qty(symbol)
+        live_qty = abs(signed)
+        if live_qty <= 0:
             logger.info(f"{symbol} close ({reason}): broker already flat - clearing state")
             self._reset_position_state(symbol)
             return False
-        side = OrderSide.SELL if self.position_side[symbol] == 'LONG' else OrderSide.BUY
+        side = OrderSide.SELL if signed > 0 else OrderSide.BUY
+        broker_side = 'LONG' if signed > 0 else 'SHORT'
+        if self.position_side.get(symbol) != broker_side:
+            logger.warning(f"{symbol} close ({reason}): tracked side {self.position_side.get(symbol)} "
+                           f"!= broker side {broker_side} - following the broker")
+        qty = min(qty, live_qty)
+        if qty <= 0:
+            return False
         self.cancel_symbol_orders(symbol)
         ok = self._execute_order(symbol, side, qty, f"CLOSE({reason})")
-        if ok:
-            price = self.get_latest_price(symbol)
-            if price is None:
-                price = self.entry_price[symbol]
-            pnl = (price - self.entry_price[symbol]) * qty \
-                if self.position_side[symbol] == 'LONG' else \
-                (self.entry_price[symbol] - price) * qty
-            self.daily_realized_pnl[symbol] += pnl
-            self.daily_trades[symbol].append({'time': datetime.now(timezone.utc), 'pnl': pnl, 'reason': reason})
-            self._reset_position_state(symbol)
-            self.cooldown[symbol] = COOLDOWN_BARS
-            send_telegram(f"{symbol} closed ({reason})\nPnL: ${pnl:+.2f}", 'exit')
-        return ok
+        if not ok:
+            # Fallback (v3.5.2): after 2 rejected market closes, cancel
+            # resting orders again and ask Alpaca to liquidate the position
+            # server-side. This endpoint is side- and qty-agnostic (it
+            # closes whatever the broker holds), so it works even when the
+            # order path is confused by foreign orders on the account. It
+            # only ever executes a decision the exit stack already made -
+            # it never decides to close on its own.
+            fails = self.close_fail_count.get(symbol, 0) + 1
+            self.close_fail_count[symbol] = fails
+            if fails >= 2:
+                try:
+                    self.cancel_symbol_orders(symbol)
+                    time.sleep(3)
+                    self.trading_client.close_position(self._pos_key(symbol))
+                    logger.warning(f"{symbol} close ({reason}): market order rejected {fails}x - "
+                                   f"used broker-side liquidation instead")
+                    ok = True
+                except Exception as e2:
+                    logger.error(f"{symbol} broker-side liquidation also failed: {e2}")
+            if fails >= 3:
+                send_telegram(
+                    f"{symbol} close ({reason}) REJECTED {fails}x by the broker and the "
+                    f"position is still OPEN. Last error: {self.last_order_error.get(symbol, '?')}. "
+                    f"Check the Alpaca dashboard - and check for a SECOND trader on this account.",
+                    'warning')
+            if not ok:
+                return False
+        price = self.get_latest_price(symbol)
+        if price is None:
+            price = self.entry_price[symbol]
+        pnl = (price - self.entry_price[symbol]) * qty \
+            if broker_side == 'LONG' else \
+            (self.entry_price[symbol] - price) * qty
+        self.daily_realized_pnl[symbol] += pnl
+        self.daily_trades[symbol].append({'time': datetime.now(timezone.utc), 'pnl': pnl, 'reason': reason})
+        self._reset_position_state(symbol)
+        self.cooldown[symbol] = COOLDOWN_BARS
+        send_telegram(f"{symbol} closed ({reason})\nPnL: ${pnl:+.2f}", 'exit')
+        return True
 
     def _reset_position_state(self, symbol: str):
         self.in_position[symbol] = False
@@ -490,6 +568,7 @@ class MultiSymbolPaperTrader:
         self.entry_bar_time[symbol] = None
         self.stop_loss[symbol] = None
         self.take_profit[symbol] = None
+        self.close_fail_count[symbol] = 0
 
     # ================= Broker reconcile / adoption (v3.4) =================
     def _reconcile_positions(self):
@@ -538,8 +617,36 @@ class MultiSymbolPaperTrader:
                         'warning')
                     self._reset_position_state(symbol)
                     self._adopt_position(symbol, signed_qty, avg_entry)
+                    continue
+                # Size-drift guard (v3.5.2): same side but the SIZE changed
+                # and no order of mine explains it => someone/something else
+                # is trading this account. The old side-only check watched
+                # PLTR double 55 -> 110 -> 330 -> 660 -> 1320 and saw
+                # nothing wrong. Re-sync to the broker size (never close)
+                # and raise the alarm.
+                tracked_qty = abs(self.position_qty.get(symbol, 0.0))
+                broker_qty = abs(signed_qty)
+                min_meaningful = 0.001 if self._is_crypto(symbol) else 0.5
+                if tracked_qty > 0 and broker_qty > 0 \
+                        and abs(broker_qty - tracked_qty) > max(min_meaningful, tracked_qty * SIZE_DRIFT_TOLERANCE):
+                    logger.warning(
+                        f"{symbol} size mismatch: tracking {tracked_qty} but broker holds "
+                        f"{broker_qty} - no order of mine explains it. Re-syncing to broker size.")
+                    now = time.time()
+                    if now - self._ghost_alerted.get(symbol, 0) > RUNAWAY_ALERT_SECONDS:
+                        self._ghost_alerted[symbol] = now
+                        send_telegram(
+                            f"⚠️ {symbol} size changed {tracked_qty} -> {broker_qty} at the broker "
+                            f"and I did NOT trade it. If you didn't trade manually, ANOTHER PROCESS "
+                            f"IS USING THIS ACCOUNT - find it and kill it "
+                            f"(docker ps / pgrep -af live_paper_trader / other machines).",
+                            'warning')
+                    self.position_qty[symbol] = broker_qty
+                    self.entry_price[symbol] = avg_entry
+                self._check_runaway(symbol, signed_qty, avg_entry)
                 continue                      # tracked and same side - leave it alone
             self._adopt_position(symbol, signed_qty, avg_entry)
+            self._check_runaway(symbol, signed_qty, avg_entry)
 
         # 2) clear positions the broker no longer holds
         for s in list(self.all_symbols):
@@ -554,6 +661,31 @@ class MultiSymbolPaperTrader:
             if s == pos_key or self._pos_key(s) == pos_key:
                 return s
         return None
+
+    def _check_runaway(self, symbol: str, signed_qty: float, avg_entry: float):
+        """Runaway-size circuit breaker (v3.5.2). A position bigger than
+        RUNAWAY_NOTIONAL_MULT x its sizing slice cannot have come from this
+        strategy - it is either the ghost-trader pile-up or a manual trade.
+        We never close it here (the exit stack owns all closes); we alert,
+        once per hour per symbol."""
+        if not USE_REAL_ACCOUNT_SIZING or self._last_equity <= 0 or avg_entry <= 0:
+            return
+        slice_cap = min(CAPITAL_PER_SYMBOL, self._last_equity * SLICE_PCT_OF_EQUITY)
+        notional = abs(signed_qty) * avg_entry
+        if notional <= slice_cap * RUNAWAY_NOTIONAL_MULT:
+            return
+        now = time.time()
+        if now - self._runaway_alerted.get(symbol, 0) <= RUNAWAY_ALERT_SECONDS:
+            return
+        self._runaway_alerted[symbol] = now
+        logger.error(f"{symbol} RUNAWAY position: ${notional:,.0f} notional is "
+                     f">{RUNAWAY_NOTIONAL_MULT:.0f}x its ${slice_cap:,.0f} slice")
+        send_telegram(
+            f"🚨 {symbol} position is ${notional:,.0f} - {notional / slice_cap:.1f}x the max size "
+            f"this strategy can open. This did NOT come from the strategy. "
+            f"I will manage it with the normal exit rules (no blind close), but you should "
+            f"check the Alpaca order history and look for a second trader.",
+            'warning')
 
     def _adopt_position(self, symbol: str, signed_qty: float, avg_entry: float):
         side = 'LONG' if signed_qty > 0 else 'SHORT'
@@ -667,7 +799,7 @@ class MultiSymbolPaperTrader:
         df = self.get_bars(symbol)
         if df is None or len(df) < SMA_PERIOD + 5:
             return None, 0.0, 'no_data'
-        latest = self.compute_indicators(df)
+        latest = self.compute_indicators(df, symbol)
         if latest is None:
             return None, 0.0, 'stale_or_warmup'
 
@@ -758,13 +890,32 @@ class MultiSymbolPaperTrader:
 
         order_side = OrderSide.BUY if side == 'LONG' else OrderSide.SELL
         if not self._execute_order(symbol, order_side, qty, f"ENTRY({side})"):
+            # Back off instead of re-submitting a rejected order every cycle
+            # (the Aug-24 SOL "insufficient balance" storm retried for hours).
+            if 'insufficient' in self.last_order_error.get(symbol, '').lower():
+                self.cooldown[symbol] = ENTRY_FAIL_COOLDOWN_CYCLES
+                logger.info(f"{symbol} entry rejected (insufficient funds) - backing off "
+                            f"{ENTRY_FAIL_COOLDOWN_CYCLES} cycles")
             return
 
         time.sleep(2)
-        actual_qty = abs(self.get_position_qty(symbol))
+        signed = self.get_position_qty(symbol)
+        actual_qty = abs(signed)
         if actual_qty <= 0:
             logger.error(f"{symbol} entry not confirmed at broker")
             return
+        broker_side = 'LONG' if signed > 0 else 'SHORT'
+        if broker_side != side:
+            # We ordered one side but the broker shows the other: leave
+            # state untouched and let the next reconcile adopt the truth.
+            logger.error(f"{symbol} entry side check failed: wanted {side}, broker shows "
+                         f"{broker_side} {actual_qty} - not tracking, reconcile will adopt")
+            send_telegram(f"{symbol} ENTRY SIDE MISMATCH: ordered {side} but the broker shows "
+                          f"{broker_side} {actual_qty} - managing from broker truth.", 'warning')
+            return
+        if actual_qty > qty * 1.5:
+            logger.warning(f"{symbol} post-entry size {actual_qty} is bigger than my order {qty} - "
+                           f"the position includes qty I did not buy (another trader?)")
 
         self.in_position[symbol] = True
         self.position_side[symbol] = side
@@ -858,6 +1009,13 @@ class MultiSymbolPaperTrader:
                     close_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
                     if self._execute_order(symbol, close_side, close_qty, "PARTIAL_TP"):
                         self.partial_closed[symbol] = True
+                        # Re-sync tracked size from the broker so the v3.5.2
+                        # size-drift guard doesn't mistake our own partial
+                        # for a foreign trade.
+                        try:
+                            self.position_qty[symbol] = abs(self.get_position_qty(symbol))
+                        except Exception:
+                            self.position_qty[symbol] = max(0.0, self.position_qty[symbol] - close_qty)
                         send_telegram(f"{symbol} partial TP: closed {close_qty}", 'partial')
 
         # 4) Trailing stop (hard)
@@ -897,12 +1055,16 @@ class MultiSymbolPaperTrader:
                     close_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
                     if self._execute_order(symbol, close_side, close_qty, "TIME_PARTIAL"):
                         self.time_partial_done[symbol] = True
+                        try:
+                            self.position_qty[symbol] = abs(self.get_position_qty(symbol))
+                        except Exception:
+                            self.position_qty[symbol] = max(0.0, self.position_qty[symbol] - close_qty)
 
         # 8) Signal flip (2 consecutive opposite signals)
         if SIGNAL_FLIP_EXIT_ENABLED:
             df_full = self.get_bars(symbol)
             if df_full is not None:
-                latest = self.compute_indicators(df_full)
+                latest = self.compute_indicators(df_full, symbol)
                 if latest is not None:
                     result = self.meta_learner.get_signal(symbol, latest, timestamp=latest['timestamp'], mode='live')
                     current = result['signal']
@@ -1064,9 +1226,9 @@ class MultiSymbolPaperTrader:
             return now.weekday() < 5 and 13 <= now.hour < 21
 
     def run(self):
-        logger.info(f"Starting 1H multi-symbol trader: stocks={self.symbols} crypto={self.crypto_symbols}")
+        logger.info(f"Starting 1H multi-symbol trader {TRADER_VERSION}: stocks={self.symbols} crypto={self.crypto_symbols}")
         send_telegram(
-            f"1H Trader started\nStocks: {', '.join(self.symbols) or 'none'}\n"
+            f"1H Trader started ({TRADER_VERSION})\nStocks: {', '.join(self.symbols) or 'none'}\n"
             f"Crypto: {', '.join(self.crypto_symbols) or 'none'}", 'info')
 
         while True:
@@ -1078,6 +1240,7 @@ class MultiSymbolPaperTrader:
                     self._reconcile_positions()   # catch mid-session changes (manual buys/sells, missed entries)
                 account = self.get_account()
                 equity = float(account.equity)
+                self._last_equity = equity
                 market_open = self._market_open()
 
                 for symbol in self.all_symbols:
