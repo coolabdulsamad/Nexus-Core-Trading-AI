@@ -1,20 +1,35 @@
 """
-src/backtester/engine.py  (v3)
+src/backtester/engine.py  (v3.6)
 Honest backtesting:
 - MetaLearner runs in mode='backtest' -> memory search is time-filtered,
   no look-ahead, no future sentiment.
 - Conviction gate |prob-0.5| works for BOTH longs and shorts.
 - Signal QUALITY gates entry and drives position size tier.
 - SL/TP detection uses bar high/low with fills at stop/limit prices.
-- Breakeven stop rule applied every bar.
 - sma_cross exit disabled (structurally guaranteed-loss).
 - v3: timeframe-aware - reads market_data{BAR_SUFFIX}/feature_cache{BAR_SUFFIX}
   and annualizes Sharpe with the correct bars-per-day for the timeframe.
-- v3.2: entry rule now matches the live trader - counter-trend signals pass
-  with a quality penalty (x0.7) UNLESS the regime also opposes them (fighting
-  both timeframes stays vetoed); crypto is long-only. A per-bar decision
-  funnel is printed so "0 trades" always explains itself.
+- v3.2: entry rule matches the live trader - counter-trend signals pass with
+  a quality penalty (x0.7) UNLESS the regime also opposes them; crypto is
+  long-only. A per-bar decision funnel is printed.
+- v3.6: FULL live/backtest parity. The v3.2 backtester had none of the live
+  exit stack, which is why backtests looked better than live. Now ports:
+  ENTRY: memory-scaled quality (q x min(1, n/80)), extreme-sentiment veto,
+  toxic regime+sentiment combo veto, counter-regime entries must be STRONG,
+  crypto momentum gate (price > sma200 AND 24h return > 0), session-open
+  blackout for stocks, loss cooldowns (24h after a stop, 72h after 2 stops
+  in 7d).
+  EXITS: profit ratchet (replaces breakeven), hard trailing stop
+  (activate +2.5 ATR / 2.5 ATR distance), retracement lock rebuilt
+  (arm +2 ATR, keep 60% of peak), in-trade re-analysis (flip against in
+  profit -> exit now; flip against underwater -> tighten stop once;
+  otherwise 2-flip confirm), time limit 16 bars.
+  KNOWN DIFFERENCE vs live: scale-outs (1/3 @ +1 ATR, 1/3 @ +2 ATR) and the
+  time-based partial are live-only - the broker simulator closes whole
+  positions. Omitting them is CONSERVATIVE for winners (backtest keeps full
+  size longer) and neutral for losers.
 """
+import re
 import psycopg2
 import pandas as pd
 import numpy as np
@@ -28,12 +43,48 @@ logger = setup_logger("BacktesterEngine", "logs/backtester.log")
 
 BAR_SECONDS = config.BAR_MINUTES * 60
 BARS_PER_DAY = 390 / config.BAR_MINUTES          # 78 at 5-min, 6.5 at 1h
-COUNTER_TREND_PENALTY = 0.7   # same rule as the live trader (v3.2)
+COUNTER_TREND_PENALTY = 0.7   # same rule as the live trader
+
+# v3.6 exit-stack switches - hardcoded module constants in the live trader
+# (live_paper_trader_multi.py lines 177-211), mirrored here for parity.
+TRAILING_STOP_ENABLED = True
+PROFIT_PROTECTION_ENABLED = True
+SIGNAL_FLIP_EXIT_ENABLED = True
+SIGNAL_FLIP_CONFIRM = 2
+TIME_LIMIT_ENABLED = True
+
+
+# ---------------------------------------------------------------------------
+# Defensive accessors - BrokerSimulator position dict keys are not guaranteed
+# ('sl' vs 'stop_loss', 'entry_price' vs 'entry').
+# ---------------------------------------------------------------------------
+def _pos_get(pos, *keys, default=None):
+    for k in keys:
+        if k in pos:
+            return pos[k]
+    return default
+
+
+def _pos_sl(pos):
+    return _pos_get(pos, 'sl', 'stop_loss')
+
+
+def _pos_set_sl(pos, value, side):
+    """Move the stop ONLY in the favorable direction (up for longs, down for shorts)."""
+    cur = _pos_sl(pos)
+    if cur is not None:
+        value = max(cur, value) if side == 'LONG' else min(cur, value)
+    if 'sl' in pos:
+        pos['sl'] = value
+    elif 'stop_loss' in pos:
+        pos['stop_loss'] = value
+    else:
+        pos['sl'] = value
 
 
 class BacktesterEngine:
     def __init__(self, symbol: str, initial_capital: float = 100000.0,
-                 start_date: str = "2026-03-24", end_date: str = "2026-06-24"):
+                 start_date: str = "2026-07-01", end_date: str = "2026-09-02"):
         self.symbol = symbol
         self.start_date = start_date
         self.end_date = end_date
@@ -43,11 +94,17 @@ class BacktesterEngine:
         self.meta_learner = MetaLearner()
         self.df = None
         self.cooldown = 0
+        # v3.6: loss-cooldown memory (epoch seconds)
+        self.last_stop_time = 0.0
+        self.stop_history = []
         self.funnel = dict(bars=0, buy=0, sell=0, hold=0, thin_memory=0,
                            counter_trend_allowed=0, blocked_trend_opposed=0,
                            blocked_crypto_short=0, blocked_conviction=0,
                            blocked_volatility=0, blocked_quality=0,
-                           blocked_daily_guard=0, blocked_size=0, entries=0)
+                           blocked_daily_guard=0, blocked_size=0, entries=0,
+                           blocked_session_open=0, blocked_sentiment=0,
+                           blocked_toxic_combo=0, blocked_counter_regime=0,
+                           blocked_crypto_momentum=0, blocked_loss_cooldown=0)
 
     def fetch_data(self) -> pd.DataFrame:
         suffix = config.BAR_SUFFIX
@@ -75,6 +132,76 @@ class BacktesterEngine:
         return df
 
     # ------------------------------------------------------------------
+    # v3.6 helpers (mirror the live trader)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_reason(reason: str):
+        """Pull regime / sentiment / memory depth out of the brain's reason string."""
+        regime, sent, n = '', None, 0
+        m = re.search(r'regime=(\w+)', reason or '')
+        if m:
+            regime = m.group(1)
+        m = re.search(r'sent=([+-]?[\d\.]+)', reason or '')
+        if m:
+            sent = float(m.group(1))
+        m = re.search(r'n=(\d+)', reason or '')
+        if m:
+            n = int(m.group(1))
+        return regime, sent, n
+
+    def _session_open_blackout(self, t) -> bool:
+        """No stock entries in the first SESSION_OPEN_NO_ENTRY_MINUTES of the US session."""
+        if '/' in self.symbol:
+            return False
+        mins = getattr(config, 'SESSION_OPEN_NO_ENTRY_MINUTES', 60)
+        if mins <= 0:
+            return False
+        if t.weekday() >= 5:
+            return False
+        open_min = 13 * 60 + 30                     # 9:30 ET = 13:30 UTC (EDT)
+        cur_min = t.hour * 60 + t.minute
+        return open_min <= cur_min < open_min + mins
+
+    def _crypto_momentum_ok(self, idx, price, sma) -> bool:
+        """LONG only above the 200-bar average AND with a positive 24h return."""
+        if not getattr(config, 'CRYPTO_MOMENTUM_GATE', True):
+            return True
+        if price <= sma:
+            return False
+        if idx >= 24:
+            ret_24h = price / float(self.df.iloc[idx - 24]['close']) - 1.0
+            return ret_24h > 0
+        return False
+
+    def _loss_cooldown_active(self, t) -> bool:
+        """24h ban after a stop-out; 72h ban after 2 stops inside 7 days."""
+        now = t.timestamp()
+        window = getattr(config, 'REPEAT_LOSS_WINDOW_DAYS', 7) * 86400
+        self.stop_history = [x for x in self.stop_history if now - x < window]
+        if len(self.stop_history) >= 2:
+            wait = getattr(config, 'REPEAT_LOSS_COOLDOWN_HOURS', 72) * 3600
+            if now - self.stop_history[-1] < wait:
+                return True
+        wait = getattr(config, 'LOSS_COOLDOWN_HOURS', 24) * 3600
+        if self.last_stop_time and now - self.last_stop_time < wait:
+            return True
+        return False
+
+    def _record_new_closes(self, t):
+        """Record realized pnl once per closed trade; feed stop-outs to the
+        loss-cooldown memory."""
+        if not self.broker.closed_trades:
+            return
+        last = self.broker.closed_trades[-1]
+        if last.get('_counted') is True:
+            return
+        self.risk.record_realized_pnl(last['pnl'])
+        last['_counted'] = True
+        if 'stop' in str(last.get('reason', '')).lower():
+            self.last_stop_time = t.timestamp()
+            self.stop_history.append(t.timestamp())
+
+    # ------------------------------------------------------------------
     def _sma_exit_confirmed(self, idx, direction) -> bool:
         """Buffered + confirmed SMA cross exit (disabled by config)."""
         if not config.SMA_EXIT_ENABLED:
@@ -90,6 +217,71 @@ class BacktesterEngine:
             if direction == 'SHORT' and not (r['close'] > r['sma_200'] + buf * r['atr_14']):
                 return False
         return True
+
+    # ------------------------------------------------------------------
+    def _manage_open_position(self, idx, row, t, price, atr, signal, quality):
+        """v3.6 exit stack - mirrors live manage_exit(). Returns exit reason or None."""
+        pos = self.broker.open_positions[0]
+        side = pos['type']
+        entry = _pos_get(pos, 'entry_price', 'entry', default=price)
+        if atr is None or atr <= 0 or np.isnan(atr):
+            return None
+
+        if side == 'LONG':
+            atr_profit = (price - entry) / atr
+        else:
+            atr_profit = (entry - price) / atr
+        peak = max(pos.get('_v36_peak', 0.0), atr_profit)
+        pos['_v36_peak'] = peak
+
+        # 2) Profit ratchet (replaces the breakeven lock): at +PROFIT_RATCHET_ATR
+        #    the stop jumps to entry +/- RATCHET_LOCK_ATR. Real money locked.
+        if not pos.get('_v36_ratchet') and atr_profit >= config.PROFIT_RATCHET_ATR:
+            lock = (entry + config.RATCHET_LOCK_ATR * atr) if side == 'LONG' \
+                else (entry - config.RATCHET_LOCK_ATR * atr)
+            _pos_set_sl(pos, lock, side)
+            pos['_v36_ratchet'] = True
+
+        # 4) Trailing stop (hard): activates at +TRAILING_STOP_ACTIVATE_ATR,
+        #    trails TRAILING_STOP_DISTANCE_ATR behind price.
+        if TRAILING_STOP_ENABLED and atr_profit >= config.TRAILING_STOP_ACTIVATE_ATR:
+            trail = (price - config.TRAILING_STOP_DISTANCE_ATR * atr) if side == 'LONG' \
+                else (price + config.TRAILING_STOP_DISTANCE_ATR * atr)
+            _pos_set_sl(pos, trail, side)
+
+        # 5) Retracement lock: arms only after a REAL peak (+RETRACEMENT_ARM_ATR)
+        #    and keeps RETRACEMENT_KEEP_PCT of it.
+        if PROFIT_PROTECTION_ENABLED and peak >= config.RETRACEMENT_ARM_ATR:
+            if atr_profit <= peak * config.RETRACEMENT_KEEP_PCT:
+                return 'retracement_lock'
+
+        # 8) Signal flip + in-trade re-analysis
+        if SIGNAL_FLIP_EXIT_ENABLED:
+            opposite = 'SELL' if side == 'LONG' else 'BUY'
+            if signal == opposite:
+                if quality >= config.MIN_SIGNAL_QUALITY and atr_profit >= config.FLIP_EXIT_PROFIT_ATR:
+                    return 'signal_flip_profit'
+                if (getattr(config, 'FLIP_TIGHTEN_UNDERWATER', True)
+                        and atr_profit < 0 and not pos.get('_v36_tightened')
+                        and quality >= config.MIN_SIGNAL_QUALITY):
+                    pos['_v36_tightened'] = True
+                    tight = (price - 1.0 * atr) if side == 'LONG' else (price + 1.0 * atr)
+                    _pos_set_sl(pos, tight, side)
+                pos['_flip_count'] = pos.get('_flip_count', 0) + 1
+                if pos['_flip_count'] >= SIGNAL_FLIP_CONFIRM:
+                    return 'signal_flip'
+            else:
+                pos['_flip_count'] = 0
+
+        # 9) SMA cross exit (disabled by config)
+        if self._sma_exit_confirmed(idx, side):
+            return 'sma_cross'
+
+        # 10) Time limit
+        bar_age = (t - pos['entry_time']).total_seconds() / BAR_SECONDS
+        if TIME_LIMIT_ENABLED and bar_age >= config.TIME_LIMIT_BARS:
+            return 'time_limit'
+        return None
 
     # ------------------------------------------------------------------
     def run(self):
@@ -110,30 +302,24 @@ class BacktesterEngine:
             if self.cooldown > 0:
                 self.cooldown -= 1
                 self.broker.check_positions(t, row['high'], row['low'], price, atr)
+                self._record_new_closes(t)
                 self._log_equity(t, price, 'HOLD', 0.5, 0.0)
                 continue
 
             # 2. SL/TP + trailing (intrabar)
             self.broker.check_positions(t, row['high'], row['low'], price, atr)
-            if self.broker.closed_trades:
-                last = self.broker.closed_trades[-1]
-                if last.get('_counted') is not True:
-                    self.risk.record_realized_pnl(last['pnl'])
-                    last['_counted'] = True
-
-            # 2b. Breakeven stop lock
-            for pos in self.broker.open_positions:
-                self.risk.update_breakeven_stop(pos, price, atr)
+            self._record_new_closes(t)
 
             # 3. AI signal (point-in-time)
             result = self.meta_learner.get_signal(self.symbol, row, timestamp=t, mode='backtest')
             signal, prob = result['signal'], result['confidence']
             quality = result.get('quality', 0.0)
+            reason = result.get('reason', '')
 
-            # 3b. Decision funnel accounting (v3.2: every bar is explained)
+            # 3b. Decision funnel accounting (every bar is explained)
             self.funnel['bars'] += 1
             self.funnel[signal.lower()] += 1
-            if 'thin_memory' in str(result.get('reason', '')):
+            if 'thin_memory' in str(reason):
                 self.funnel['thin_memory'] += 1
 
             # 4. Gates
@@ -143,26 +329,79 @@ class BacktesterEngine:
             conviction_ok = abs(prob - 0.5) >= config.ENTRY_CONVICTION_MARGIN
             can_trade, day_reason = self.risk.can_open_new_position(equity)
 
-            # 5. Entry (flat only) - v3.2 regime-aware trend rule (same as live)
+            # 5. Entry (flat only) - v3.6 gate chain, mirrors live check_entry
             if len(self.broker.open_positions) == 0:
                 proceed = signal in ('BUY', 'SELL')
                 eff_quality = quality
                 if proceed:
+                    side0 = 'LONG' if signal == 'BUY' else 'SHORT'
                     sma = row['sma_200']
-                    with_trend = ((signal == 'BUY' and price > sma) or
-                                  (signal == 'SELL' and price < sma))
+
+                    # v3.6: quality is only as good as the memory behind it
+                    r_regime, r_sent, n_mem = self._parse_reason(reason)
+                    regime = r_regime or (row.get('regime_label')
+                                          if isinstance(row.get('regime_label'), str)
+                                          and row.get('regime_label') else 'unknown')
+                    sent = r_sent
+                    if sent is None:
+                        s = row.get('sentiment_score')
+                        sent = float(s) if s is not None and pd.notna(s) else 0.0
+                    ref_n = getattr(config, 'QUALITY_MEMORY_REF_N', 80)
+                    eff_quality = quality * min(1.0, (n_mem / ref_n) if ref_n else 1.0) \
+                        if n_mem else quality * 0.5
+
+                    veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.60)
+                    veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.60)
+                    toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.30)
+                    regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.60)
+
+                    if self._session_open_blackout(t):
+                        self.funnel['blocked_session_open'] += 1
+                        proceed = False
+                    elif self._loss_cooldown_active(t):
+                        self.funnel['blocked_loss_cooldown'] += 1
+                        proceed = False
+                    elif side0 == 'LONG' and sent <= veto_long:
+                        self.funnel['blocked_sentiment'] += 1
+                        proceed = False
+                    elif side0 == 'SHORT' and sent >= veto_short:
+                        self.funnel['blocked_sentiment'] += 1
+                        proceed = False
+                    elif side0 == 'LONG' and regime == 'trend_down' and sent <= toxic_sent:
+                        self.funnel['blocked_toxic_combo'] += 1
+                        proceed = False
+                    elif side0 == 'SHORT' and regime == 'trend_up' and sent >= -toxic_sent:
+                        self.funnel['blocked_toxic_combo'] += 1
+                        proceed = False
+                    elif ((side0 == 'LONG' and regime == 'trend_down') or
+                          (side0 == 'SHORT' and regime == 'trend_up')) and eff_quality < regime_min_q:
+                        self.funnel['blocked_counter_regime'] += 1
+                        proceed = False
+                    elif side0 == 'LONG' and '/' in self.symbol and \
+                            not self._crypto_momentum_ok(idx, price, sma):
+                        self.funnel['blocked_crypto_momentum'] += 1
+                        proceed = False
+
+                if proceed:
+                    with_trend = ((signal == 'BUY' and price > row['sma_200']) or
+                                  (signal == 'SELL' and price < row['sma_200']))
                     if not with_trend:
-                        regime = row.get('regime_label')
-                        regime = regime if isinstance(regime, str) and regime else 'unknown'
+                        # Counter-trend: fighting BOTH timeframes stays vetoed
+                        # (live: "fights both timeframes" block); otherwise
+                        # allowed at reduced quality.
                         opposed = ((signal == 'SELL' and regime == 'trend_up') or
                                    (signal == 'BUY' and regime == 'trend_down'))
                         if opposed:
                             self.funnel['blocked_trend_opposed'] += 1
                             proceed = False
                         else:
-                            eff_quality = quality * COUNTER_TREND_PENALTY
-                            if eff_quality >= config.MIN_SIGNAL_QUALITY:
+                            adj = eff_quality * COUNTER_TREND_PENALTY
+                            if adj >= config.MIN_SIGNAL_QUALITY:
                                 self.funnel['counter_trend_allowed'] += 1
+                                eff_quality = adj
+                            else:
+                                self.funnel['blocked_quality'] += 1
+                                proceed = False
                     if proceed and signal == 'SELL' and '/' in self.symbol:
                         self.funnel['blocked_crypto_short'] += 1
                         proceed = False
@@ -184,27 +423,12 @@ class BacktesterEngine:
                             else:
                                 self.broker.open_short(t, self.risk.apply_slippage(price, True), size, sl, tp)
                             self.funnel['entries'] += 1
-                            logger.info(f"{signal} ({result.get('reason','')}) q={quality:.3f} eff={eff_quality:.3f}")
+                            logger.info(f"{signal} ({reason}) q={quality:.3f} eff={eff_quality:.3f}")
                         else:
                             self.funnel['blocked_size'] += 1
             else:
-                # 6. Exit management
-                pos = self.broker.open_positions[0]
-                exit_reason = None
-                if pos['type'] == 'LONG':
-                    if signal == 'SELL':
-                        exit_reason = "signal_flip"
-                    elif self._sma_exit_confirmed(idx, 'LONG'):
-                        exit_reason = "sma_cross"
-                else:
-                    if signal == 'BUY':
-                        exit_reason = "signal_flip"
-                    elif self._sma_exit_confirmed(idx, 'SHORT'):
-                        exit_reason = "sma_cross"
-
-                bar_age = (t - pos['entry_time']).total_seconds() / BAR_SECONDS
-                if exit_reason is None and bar_age >= config.TIME_LIMIT_BARS:
-                    exit_reason = "time_limit"
+                # 6. Exit management (v3.6 stack)
+                exit_reason = self._manage_open_position(idx, row, t, price, atr, signal, quality)
 
                 if exit_reason:
                     exit_price = self.risk.apply_slippage(price, is_entry=False)
@@ -254,7 +478,7 @@ class BacktesterEngine:
         win_rate = len(wins) / len(trades) * 100 if trades else 0
 
         print("\n" + "=" * 60)
-        print(f"HONEST AI BACKTEST: {self.symbol} ({config.BAR_MINUTES}-min bars)")
+        print(f"HONEST AI BACKTEST v3.6: {self.symbol} ({config.BAR_MINUTES}-min bars)")
         print("=" * 60)
         print(f"Period:         {self.start_date} -> {self.end_date}")
         print(f"Initial:        ${init:,.2f}   Final: ${final:,.2f}   Return: {ret_pct:+.2f}%")
@@ -268,7 +492,10 @@ class BacktesterEngine:
         print(f"  Memory thin/missing:    {f['thin_memory']:<6} (if this equals bars, Qdrant/memory is DOWN)")
         print(f"  Entries taken:          {f['entries']:<6} (counter-trend allowed: {f['counter_trend_allowed']})")
         print(f"  Blocked by quality:     {f['blocked_quality']:<6} (incl. counter-trend x{COUNTER_TREND_PENALTY} penalty)")
-        print(f"  Blocked trend-opposed:  {f['blocked_trend_opposed']:<6} (signal fights BOTH timeframes)")
+        print(f"  Blocked sentiment veto: {f['blocked_sentiment']:<6} Blocked toxic combo: {f['blocked_toxic_combo']}")
+        print(f"  Blocked counter-regime: {f['blocked_counter_regime']:<6} (needs eff_q >= {getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.60):.2f})")
+        print(f"  Blocked crypto momentum:{f['blocked_crypto_momentum']:<6} Blocked session-open: {f['blocked_session_open']}")
+        print(f"  Blocked loss-cooldown:  {f['blocked_loss_cooldown']:<6} Blocked trend-opposed: {f['blocked_trend_opposed']}")
         print(f"  Blocked conviction:     {f['blocked_conviction']:<6} Blocked volatility: {f['blocked_volatility']}")
         print(f"  Blocked daily-guard:    {f['blocked_daily_guard']:<6} Blocked size: {f['blocked_size']}  Crypto shorts skipped: {f['blocked_crypto_short']}")
         if trades:
@@ -285,7 +512,7 @@ class BacktesterEngine:
                 r['pnl'] += t['pnl']
                 r['wins'] += 1 if t['pnl'] > 0 else 0
             for reason, r in sorted(reasons.items(), key=lambda x: x[1]['pnl']):
-                print(f"  {reason:<16} n={r['n']:<4} win%={r['wins']/r['n']*100:5.1f}  pnl=${r['pnl']:+,.2f}")
+                print(f"  {reason:<20} n={r['n']:<4} win%={r['wins']/r['n']*100:5.1f}  pnl=${r['pnl']:+,.2f}")
         print("=" * 60)
 
         pd.DataFrame(self.broker.equity_curve).to_csv(f"logs/equity_ai_{self.symbol}.csv", index=False)
@@ -294,6 +521,6 @@ class BacktesterEngine:
 if __name__ == "__main__":
     import sys
     symbol = sys.argv[1] if len(sys.argv) > 1 else "AAPL"
-    start = sys.argv[2] if len(sys.argv) > 2 else "2026-03-24"
-    end = sys.argv[3] if len(sys.argv) > 3 else "2026-06-24"
+    start = sys.argv[2] if len(sys.argv) > 2 else "2026-07-01"
+    end = sys.argv[3] if len(sys.argv) > 3 else "2026-09-02"
     BacktesterEngine(symbol, start_date=start, end_date=end).run()

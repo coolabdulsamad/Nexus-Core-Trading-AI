@@ -92,6 +92,30 @@ v3.5.2 (the PLTR pile-up post-mortem, Aug 26):
   qty; a rejected entry with "insufficient" now backs off for 30 min
   instead of spamming a failing order every 5 minutes.
 - The stale-data warning now names the symbol.
+
+v3.6 (the "no edge" post-mortem, Sep 2 - one week of evidence):
+- ENTRY ANALYSIS GATES. The losing cluster was identical every time: BUY in
+  regime=trend_down with fearful sentiment on a thin (n=35) memory, quality
+  ~0.45 that predicted nothing (winners and losers both averaged q~0.40).
+  Now: quality is scaled by memory depth (q x min(1, n/80)) and the floor is
+  0.35; extreme sentiment vetoes entries; trend_down longs must be STRONG;
+  crypto longs need price > 200-bar SMA AND a positive 24h return (crypto
+  sentiment is always 0 - no news feed - so momentum is the honesty check);
+  no stock entries in the first 60 min of the session.
+- EXIT STACK REBUILD. The old retracement lock armed at +0.7 ATR and exited
+  at +0.5 ATR: winners were cut to ~+$28 crumbs (median hold 1.6h) while
+  losers ran the full -2 ATR stop (avg -$260). Breakeven and trailing fired
+  ZERO times in a week. Now: scale out 1/3 at +1 ATR and +2 ATR; the stop
+  ratchets to entry+0.5 ATR at +1.5 ATR profit; a real trailing stop from
+  +2.5 ATR; the retracement lock arms at +2 ATR and keeps 60% of the peak.
+- IN-TRADE RE-ANALYSIS. Every cycle the brain re-judges the open position:
+  flipped against while up >= 0.5 ATR -> take profit immediately; flipped
+  against while underwater -> tighten the stop to 1 ATR (once).
+- LOSS COOLDOWNS. A stop-out bans the symbol for 24h (two stops in a week:
+  72h). ETH was stopped 3x in 7h on Aug 30-31 on a 5-minute cooldown.
+- Telegram: entries show the full "why" (q, n, regime, sentiment, vetoes);
+  ratchets, scale-outs and flips against open positions alert immediately;
+  exits report R-multiple, hold time and % of peak kept.
 """
 import os
 import sys
@@ -148,8 +172,8 @@ TRAILING_TP_ACTIVATE = config.TRAILING_TP_ATR_TRIGGER
 TRAILING_TP_DISTANCE = config.TRAILING_TP_DISTANCE_ATR
 BREAKEVEN_ATR = config.BREAKEVEN_ATR_MULTIPLE      # 1.5
 
-TRAILING_STOP_ACTIVATE = 4.0      # ATR profit to activate hard trailing stop
-TRAILING_STOP_DISTANCE = 6.0      # ATR behind price
+TRAILING_STOP_ACTIVATE = config.TRAILING_STOP_ACTIVATE_ATR   # v3.6: 2.5 ATR (was hardcoded 4.0 - never fired)
+TRAILING_STOP_DISTANCE = config.TRAILING_STOP_DISTANCE_ATR   # v3.6: 2.5 ATR (was hardcoded 6.0)
 TRAILING_STOP_ENABLED = True
 
 MAX_SPREAD_PCT = 0.002
@@ -168,8 +192,10 @@ SMA_EXIT_ENABLED = config.SMA_EXIT_ENABLED
 SMA_EXIT_CONFIRM_BARS = config.SMA_EXIT_CONFIRM_BARS
 
 PROFIT_PROTECTION_ENABLED = True
-RETRACEMENT_HIGH = config.RETRACEMENT_HIGH_THRESHOLD
-RETRACEMENT_LOCK = config.RETRACEMENT_LOCK_THRESHOLD
+RETRACEMENT_ARM_ATR = config.RETRACEMENT_ARM_ATR        # v3.6: arm at +2 ATR peak (was 0.70)
+RETRACEMENT_KEEP_PCT = config.RETRACEMENT_KEEP_PCT      # v3.6: keep 60% of peak (was fixed 0.50 ATR)
+PROFIT_RATCHET_ATR = config.PROFIT_RATCHET_ATR
+RATCHET_LOCK_ATR = config.RATCHET_LOCK_ATR
 
 DAILY_PROFIT_TARGET_ENABLED = config.DAILY_PROFIT_TARGET_PCT > 0
 DAILY_TARGET_PCT = config.DAILY_PROFIT_TARGET_PCT
@@ -188,7 +214,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.5.2"
+TRADER_VERSION = "v3.6"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -267,12 +293,19 @@ class MultiSymbolPaperTrader:
         self.daily_realized_pnl = {s: 0.0 for s in self.all_symbols}
         self.daily_target_hit = {s: False for s in self.all_symbols}
         self.time_partial_done = {s: False for s in self.all_symbols}
+        self.scale_out_1_done = {s: False for s in self.all_symbols}
+        self.scale_out_2_done = {s: False for s in self.all_symbols}
+        self.ratchet_done = {s: False for s in self.all_symbols}
+        self.flip_tightened = {s: False for s in self.all_symbols}
         self.active_orders: Dict[str, str] = {}
         self.close_fail_count = {s: 0 for s in self.all_symbols}
         self.last_order_error: Dict[str, str] = {}
         self._ghost_alerted: Dict[str, float] = {}
         self._runaway_alerted: Dict[str, float] = {}
         self._last_equity = 0.0
+        # v3.6: loss cooldowns (stop-out bans)
+        self.last_stop_time: Dict[str, float] = {}
+        self.stop_history: Dict[str, list] = {}
 
         self.last_report_date = None
         self.cycle_count = 0
@@ -365,6 +398,10 @@ class MultiSymbolPaperTrader:
         self.daily_realized_pnl[s] = 0.0
         self.daily_target_hit[s] = False
         self.close_fail_count[s] = 0
+        self.scale_out_1_done[s] = False
+        self.scale_out_2_done[s] = False
+        self.ratchet_done[s] = False
+        self.flip_tightened[s] = False
 
     # ================= Market data =================
     def _get_data_client(self, symbol: str):
@@ -453,7 +490,8 @@ class MultiSymbolPaperTrader:
         except Exception as e:
             logger.error(f"{symbol} cancel orders failed: {e}")
 
-    def _wait_fill(self, order_id: str, timeout: int = 30) -> bool:
+    def _wait_fill(self, order_id: str, timeout: int = None) -> bool:
+        timeout = timeout or getattr(config, 'ORDER_FILL_TIMEOUT_SECONDS', 90)
         t0 = time.time()
         while time.time() - t0 < timeout:
             try:
@@ -549,9 +587,30 @@ class MultiSymbolPaperTrader:
             (self.entry_price[symbol] - price) * qty
         self.daily_realized_pnl[symbol] += pnl
         self.daily_trades[symbol].append({'time': datetime.now(timezone.utc), 'pnl': pnl, 'reason': reason})
+        # v3.6: richer exit math, captured BEFORE state reset
+        entry = self.entry_price[symbol]
+        atr = self.atr[symbol] or 0.0
+        peak_px = self.highest_price[symbol] if broker_side == 'LONG' else self.lowest_price[symbol]
+        peak_atr = 0.0
+        if atr > 0 and entry > 0 and peak_px:
+            peak_atr = ((peak_px - entry) if broker_side == 'LONG' else (entry - peak_px)) / atr
+        keep_pct = (pnl / (peak_atr * atr * qty) * 100.0) if (peak_atr > 0 and atr > 0) else 0.0
+        r_mult = (pnl / (config.STOP_ATR_MULT * atr * qty)) if atr > 0 else 0.0
+        hold_h = 0.0
+        if self.entry_bar_time[symbol]:
+            hold_h = (datetime.now(timezone.utc) - self.entry_bar_time[symbol]).total_seconds() / 3600.0
+        # v3.6: stop-outs feed the loss-cooldown memory
+        if reason == 'STOP_LOSS':
+            self.last_stop_time[symbol] = time.time()
+            self.stop_history.setdefault(symbol, []).append(time.time())
+            cutoff = time.time() - config.REPEAT_LOSS_WINDOW_DAYS * 86400
+            self.stop_history[symbol] = [t for t in self.stop_history[symbol] if t >= cutoff]
         self._reset_position_state(symbol)
         self.cooldown[symbol] = COOLDOWN_BARS
-        send_telegram(f"{symbol} closed ({reason})\nPnL: ${pnl:+.2f}", 'exit')
+        send_telegram(
+            f"{symbol} closed ({reason})\n"
+            f"PnL: ${pnl:+.2f} ({r_mult:+.1f}R) | held {hold_h:.1f}h\n"
+            f"peak +{peak_atr:.1f} ATR, kept {keep_pct:.0f}% of peak", 'exit')
         return True
 
     def _reset_position_state(self, symbol: str):
@@ -565,10 +624,18 @@ class MultiSymbolPaperTrader:
         self.trailing_tp_set[symbol] = False
         self.partial_closed[symbol] = False
         self.time_partial_done[symbol] = False
+        self.scale_out_1_done[symbol] = False
+        self.scale_out_2_done[symbol] = False
+        self.ratchet_done[symbol] = False
+        self.flip_tightened[symbol] = False
         self.entry_bar_time[symbol] = None
         self.stop_loss[symbol] = None
         self.take_profit[symbol] = None
         self.close_fail_count[symbol] = 0
+        self.scale_out_1_done[symbol] = False
+        self.scale_out_2_done[symbol] = False
+        self.ratchet_done[symbol] = False
+        self.flip_tightened[symbol] = False
 
     # ================= Broker reconcile / adoption (v3.4) =================
     def _reconcile_positions(self):
@@ -795,7 +862,55 @@ class MultiSymbolPaperTrader:
         return True
 
     # ================= Entry =================
+    @staticmethod
+    def _parse_reason(reason: str):
+        """Pull regime / sentiment / memory depth out of the brain's reason string."""
+        regime, sent, n = '', 0.0, 0
+        m = re.search(r'regime=(\w+)', reason or '')
+        if m:
+            regime = m.group(1)
+        m = re.search(r'sent=([+-]?[\d\.]+)', reason or '')
+        if m:
+            sent = float(m.group(1))
+        m = re.search(r'n=(\d+)', reason or '')
+        if m:
+            n = int(m.group(1))
+        return regime, sent, n
+
+    def _session_open_blackout(self, symbol: str) -> bool:
+        """v3.6: no stock entries in the first SESSION_OPEN_NO_ENTRY_MINUTES of
+        the US session - the open is where spread/volatility whipsawed entries
+        all week (9 of 26 stock entries fired in the first 90 min; 4 orders
+        died unfilled there)."""
+        if self._is_crypto(symbol):
+            return False
+        mins = getattr(config, 'SESSION_OPEN_NO_ENTRY_MINUTES', 60)
+        if mins <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        if now.weekday() >= 5:
+            return False
+        open_min = 13 * 60 + 30                     # 9:30 ET = 13:30 UTC (EDT)
+        cur_min = now.hour * 60 + now.minute
+        return open_min <= cur_min < open_min + mins
+
+    def _crypto_momentum_ok(self, symbol: str, df: pd.DataFrame, price: float, sma: float) -> bool:
+        """v3.6: crypto sentiment is ALWAYS 0 (no news feed), so momentum is
+        the honesty check: LONG only above the 200-bar average AND with a
+        positive 24h return. Blocks knife-catching (ETH fell 2504->2411 while
+        the brain kept saying regime=trend_up)."""
+        if not getattr(config, 'CRYPTO_MOMENTUM_GATE', True):
+            return True
+        if price <= sma:
+            return False
+        if len(df) >= 25:
+            ret_24h = price / float(df.iloc[-25]['close']) - 1.0
+            return ret_24h > 0
+        return False
+
     def check_entry(self, symbol: str) -> Tuple[Optional[str], float, str]:
+        if self._session_open_blackout(symbol):
+            return None, 0.0, 'session_open_blackout'
         df = self.get_bars(symbol)
         if df is None or len(df) < SMA_PERIOD + 5:
             return None, 0.0, 'no_data'
@@ -813,45 +928,103 @@ class MultiSymbolPaperTrader:
         if sma is None or np.isnan(sma):
             return None, 0.0, 'no_sma'
 
-        regime = ''
-        m = re.search(r'regime=(\w+)', reason or '')
-        if m:
-            regime = m.group(1)
+        regime, sent, n_mem = self._parse_reason(reason)
 
-        # With-trend entries: unchanged
+        # v3.6: quality is only as good as the memory behind it. A q=0.46
+        # built on 35 neighbors is NOT better than a q=0.20 built on 100 -
+        # scale by depth before any gate looks at it.
+        ref_n = getattr(config, 'QUALITY_MEMORY_REF_N', 80)
+        eff_quality = quality * min(1.0, (n_mem / ref_n) if ref_n else 1.0) if n_mem else quality * 0.5
+
+        # v3.6 entry analysis gates (the losing cluster was always the same:
+        # BUY + trend_down + fearful sentiment + thin memory)
+        if signal in ('BUY', 'SELL'):
+            side0 = 'LONG' if signal == 'BUY' else 'SHORT'
+            veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.60)
+            veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.60)
+            toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.30)
+            regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.60)
+            if side0 == 'LONG' and sent <= veto_long:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment ({sent:+.2f} <= {veto_long:+.2f})")
+                return None, eff_quality, reason
+            if side0 == 'SHORT' and sent >= veto_short:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment ({sent:+.2f} >= {veto_short:+.2f})")
+                return None, eff_quality, reason
+            if side0 == 'LONG' and regime == 'trend_down' and sent <= toxic_sent:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: toxic combo "
+                            f"(regime=trend_down AND sent {sent:+.2f} <= {toxic_sent:+.2f})")
+                return None, eff_quality, reason
+            if side0 == 'SHORT' and regime == 'trend_up' and sent >= -toxic_sent:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: toxic combo "
+                            f"(regime=trend_up AND sent {sent:+.2f} >= {-toxic_sent:+.2f})")
+                return None, eff_quality, reason
+            if ((side0 == 'LONG' and regime == 'trend_down') or
+                    (side0 == 'SHORT' and regime == 'trend_up')) and eff_quality < regime_min_q:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} eff={eff_quality:.3f} BLOCKED: "
+                            f"counter-regime entries must be STRONG (>= {regime_min_q:.2f})")
+                return None, eff_quality, reason
+            if side0 == 'LONG' and self._is_crypto(symbol) and not self._crypto_momentum_ok(symbol, df, price, sma):
+                logger.info(f"{symbol} | BUY q={quality:.3f} BLOCKED: crypto momentum gate "
+                            f"(need price > 200-bar avg AND 24h return > 0)")
+                return None, eff_quality, reason
+
+        # With-trend entries
         if signal == 'BUY' and price > sma:
-            return 'LONG', quality, reason
+            return 'LONG', eff_quality, reason
         if signal == 'SELL' and price < sma:
             if self._is_crypto(symbol):
                 logger.info(f"{symbol} | SELL q={quality:.3f} skipped: crypto is long-only on Alpaca spot")
-                return None, quality, reason
-            return 'SHORT', quality, reason
+                return None, eff_quality, reason
+            return 'SHORT', eff_quality, reason
 
         # Counter-trend (v3.2): allowed at reduced quality UNLESS the
         # short-term regime also disagrees (fighting both timeframes = veto).
-        if signal in ('BUY', 'SELL') and quality >= config.MIN_SIGNAL_QUALITY:
+        if signal in ('BUY', 'SELL') and eff_quality >= config.MIN_SIGNAL_QUALITY:
             opposed = ((signal == 'SELL' and regime == 'trend_up') or
                        (signal == 'BUY' and regime == 'trend_down'))
             relation = 'above' if price > sma else 'below'
             if opposed:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: fights both timeframes "
                             f"(price {relation} 200-bar avg, regime={regime or 'unknown'})")
-                return None, quality, reason
-            adj = quality * COUNTER_TREND_PENALTY
+                return None, eff_quality, reason
+            adj = eff_quality * COUNTER_TREND_PENALTY
             if adj < config.MIN_SIGNAL_QUALITY:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: counter-trend penalty "
                             f"-> effective q={adj:.3f} below gate {config.MIN_SIGNAL_QUALITY:.2f}")
-                return None, quality, reason
+                return None, eff_quality, reason
             if signal == 'SELL' and self._is_crypto(symbol):
                 logger.info(f"{symbol} | SELL q={quality:.3f} skipped: crypto is long-only on Alpaca spot")
-                return None, quality, reason
+                return None, eff_quality, reason
             side = 'LONG' if signal == 'BUY' else 'SHORT'
             logger.info(f"{symbol} | {signal} q={quality:.3f} counter-trend ALLOWED "
                         f"(penalty x{COUNTER_TREND_PENALTY} -> effective q={adj:.3f}, regime={regime or 'unknown'})")
             return side, adj, reason
-        return None, quality, reason
+        return None, eff_quality, reason
 
-    def enter_position(self, symbol: str, side: str, quality: float):
+    def _loss_cooldown_active(self, symbol: str) -> Optional[str]:
+        """v3.6: after a STOP_LOSS the symbol is banned for LOSS_COOLDOWN_HOURS;
+        two stop-outs inside REPEAT_LOSS_WINDOW_DAYS ban it for
+        REPEAT_LOSS_COOLDOWN_HOURS. (ETH was stopped 3x in 7h on a 5-min
+        cooldown - never again.)"""
+        now = time.time()
+        hist = [t for t in self.stop_history.get(symbol, [])
+                if now - t < getattr(config, 'REPEAT_LOSS_WINDOW_DAYS', 7) * 86400]
+        self.stop_history[symbol] = hist
+        if len(hist) >= 2:
+            wait = getattr(config, 'REPEAT_LOSS_COOLDOWN_HOURS', 72) * 3600
+            if now - hist[-1] < wait:
+                return f"repeat-loss ban ({len(hist)} stops in {getattr(config, 'REPEAT_LOSS_WINDOW_DAYS', 7)}d)"
+        last = self.last_stop_time.get(symbol, 0)
+        wait = getattr(config, 'LOSS_COOLDOWN_HOURS', 24) * 3600
+        if last and now - last < wait:
+            return f"stop-out cooldown ({(wait - (now - last)) / 3600:.0f}h left)"
+        return None
+
+    def enter_position(self, symbol: str, side: str, quality: float, reason: str = ''):
+        ban = self._loss_cooldown_active(symbol)
+        if ban:
+            logger.info(f"{symbol} entry skipped: {ban}")
+            return
         # Full bar window: calculate_all_indicators() dropna()s the 200-bar
         # warm-up, so a short window returns an EMPTY frame (the v3.2 bug
         # that silently killed every entry).
@@ -929,11 +1102,14 @@ class MultiSymbolPaperTrader:
         tp_distance = STOP_ATR_MULT * REWARD_RISK_RATIO * atr
         self.take_profit[symbol] = (price + tp_distance) if side == 'LONG' else (price - tp_distance)
 
+        _reg, _sent, _n = self._parse_reason(reason)
         send_telegram(
             f"{symbol} {side} ENTRY\n"
             f"Price: ${price:.2f} | Qty: {actual_qty}\n"
             f"SL: ${self.stop_loss[symbol]:.2f} | TP: ${self.take_profit[symbol]:.2f}\n"
-            f"Quality: {quality:.2f} ({self._quality_tier(quality)})", 'entry')
+            f"Quality: {quality:.2f} ({self._quality_tier(quality)}) | memory n={_n}\n"
+            f"Analysis: regime={_reg or '?'} | sentiment={_sent:+.2f} | "
+            f"vetoes passed: sentiment, regime, momentum, session-open", 'entry')
         logger.info(f"{symbol} {side} entered @ {price:.2f} qty={actual_qty}")
 
     # ================= Exit management =================
@@ -987,39 +1163,50 @@ class MultiSymbolPaperTrader:
             atr_profit = (entry - price) / atr
             peak_profit = (entry - self.lowest_price[symbol]) / atr
 
-        # 2) Breakeven lock
-        if not self.breakeven_set[symbol] and atr_profit >= BREAKEVEN_ATR:
+        # 2) Profit ratchet (v3.6 - replaces the breakeven lock, which fired
+        #    ZERO times all week): at +PROFIT_RATCHET_ATR the stop jumps to
+        #    entry + RATCHET_LOCK_ATR. Real money locked, not breakeven.
+        if not self.ratchet_done[symbol] and atr_profit >= PROFIT_RATCHET_ATR:
+            lock = (entry + RATCHET_LOCK_ATR * atr) if side == 'LONG' else (entry - RATCHET_LOCK_ATR * atr)
             if side == 'LONG':
-                self.stop_loss[symbol] = max(self.stop_loss[symbol], entry * 1.0005)
+                self.stop_loss[symbol] = max(self.stop_loss[symbol], lock)
             else:
-                self.stop_loss[symbol] = min(self.stop_loss[symbol], entry * 0.9995)
-            self.breakeven_set[symbol] = True
-            send_telegram(f"{symbol} stop -> breakeven (+{atr_profit:.1f} ATR)", 'info')
+                self.stop_loss[symbol] = min(self.stop_loss[symbol], lock)
+            self.ratchet_done[symbol] = True
+            send_telegram(f"🔒 {symbol} +{atr_profit:.1f} ATR - stop ratcheted to lock "
+                          f"+{RATCHET_LOCK_ATR:.1f} ATR (${self.stop_loss[symbol]:.2f})", 'info')
 
-        # 3) Partial take profit
-        if config.ENABLE_PARTIAL_TAKE_PROFIT and not self.partial_closed[symbol]:
-            if side == 'LONG':
-                tp_prog = (price - entry) / max(self.take_profit[symbol] - entry, 1e-9)
-            else:
-                tp_prog = (entry - price) / max(entry - self.take_profit[symbol], 1e-9)
-            if tp_prog >= PARTIAL_TP_THRESHOLD:
-                close_qty = qty * PARTIAL_CLOSE_PCT
-                close_qty = round(close_qty, 6) if self._is_crypto(symbol) else int(close_qty)
-                if close_qty > 0:
-                    close_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
-                    if self._execute_order(symbol, close_side, close_qty, "PARTIAL_TP"):
-                        self.partial_closed[symbol] = True
-                        # Re-sync tracked size from the broker so the v3.5.2
-                        # size-drift guard doesn't mistake our own partial
-                        # for a foreign trade.
-                        try:
-                            self.position_qty[symbol] = abs(self.get_position_qty(symbol))
-                        except Exception:
-                            self.position_qty[symbol] = max(0.0, self.position_qty[symbol] - close_qty)
-                        send_telegram(f"{symbol} partial TP: closed {close_qty}", 'partial')
+        # 3) Scale-outs (v3.6 - replaces the fixed partial TP): bank a third
+        #    at +SCALE_OUT_1_ATR and another at +SCALE_OUT_2_ATR, trail the rest.
+        if getattr(config, 'SCALE_OUT_ENABLED', True):
+            for flag, level, label in (('scale_out_1_done', config.SCALE_OUT_1_ATR, f"1/3 @ +{config.SCALE_OUT_1_ATR:.0f} ATR"),
+                                       ('scale_out_2_done', config.SCALE_OUT_2_ATR, f"1/3 @ +{config.SCALE_OUT_2_ATR:.0f} ATR")):
+                done = getattr(self, flag)
+                if not done[symbol] and atr_profit >= level:
+                    close_qty = qty * config.SCALE_OUT_PCT
+                    close_qty = round(close_qty, 6) if self._is_crypto(symbol) else int(close_qty)
+                    if close_qty > 0:
+                        close_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+                        if self._execute_order(symbol, close_side, close_qty, f"SCALE_OUT({label})"):
+                            done[symbol] = True
+                            # Re-sync tracked size from the broker so the
+                            # size-drift guard doesn't mistake our own
+                            # scale-out for a foreign trade.
+                            try:
+                                self.position_qty[symbol] = abs(self.get_position_qty(symbol))
+                            except Exception:
+                                self.position_qty[symbol] = max(0.0, self.position_qty[symbol] - close_qty)
+                            send_telegram(f"💰 {symbol} scale-out {label}: banked {close_qty} @ ${price:.2f} - "
+                                          f"trailing the rest", 'partial')
+                    break   # one scale-out per cycle
 
-        # 4) Trailing stop (hard)
+        # 4) Trailing stop (hard) - v3.6: activates at +2.5 ATR, trails 2.5
+        #    ATR behind price (the old 4.0/6.0 settings never fired once).
         if TRAILING_STOP_ENABLED and atr_profit >= TRAILING_STOP_ACTIVATE:
+            if not self.trailing_tp_set[symbol]:
+                self.trailing_tp_set[symbol] = True
+                send_telegram(f"📈 {symbol} trailing stop engaged at +{atr_profit:.1f} ATR "
+                              f"(trail {TRAILING_STOP_DISTANCE:.1f} ATR behind price)", 'info')
             if side == 'LONG':
                 trail = price - TRAILING_STOP_DISTANCE * atr
                 self.stop_loss[symbol] = max(self.stop_loss[symbol], trail)
@@ -1027,24 +1214,15 @@ class MultiSymbolPaperTrader:
                 trail = price + TRAILING_STOP_DISTANCE * atr
                 self.stop_loss[symbol] = min(self.stop_loss[symbol], trail)
 
-        # 5) Profit retracement lock
-        if PROFIT_PROTECTION_ENABLED and peak_profit >= RETRACEMENT_HIGH:
-            if atr_profit <= RETRACEMENT_LOCK:
+        # 5) Retracement lock (v3.6 rebuild): arms only after a REAL peak
+        #    (+2 ATR, not +0.7) and keeps 60% of it. The old version cut
+        #    winners to ~+$28 crumbs after a median 1.6h hold.
+        if PROFIT_PROTECTION_ENABLED and peak_profit >= RETRACEMENT_ARM_ATR:
+            if atr_profit <= peak_profit * RETRACEMENT_KEEP_PCT:
                 return 'RETRACEMENT_LOCK'
 
-        # 6) Trailing take-profit
-        if config.ENABLE_TRAILING_TP and not self.trailing_tp_set[symbol] and atr_profit >= TRAILING_TP_ACTIVATE:
-            self.trailing_tp_set[symbol] = True
-            send_telegram(f"{symbol} trailing TP armed at +{atr_profit:.1f} ATR", 'info')
-        if self.trailing_tp_set[symbol]:
-            if side == 'LONG':
-                trail_tp = self.highest_price[symbol] - TRAILING_TP_DISTANCE * atr
-                if price <= trail_tp:
-                    return 'TRAILING_TP'
-            else:
-                trail_tp = self.lowest_price[symbol] + TRAILING_TP_DISTANCE * atr
-                if price >= trail_tp:
-                    return 'TRAILING_TP'
+        # 6) (removed in v3.6 - the old trailing TP never fired; the v3.6
+        #    trailing stop in step 4 does this job)
 
         # 7) Time-based partial
         if TIME_PARTIAL_ENABLED and not self.time_partial_done[symbol]:
@@ -1060,7 +1238,10 @@ class MultiSymbolPaperTrader:
                         except Exception:
                             self.position_qty[symbol] = max(0.0, self.position_qty[symbol] - close_qty)
 
-        # 8) Signal flip (2 consecutive opposite signals)
+        # 8) Signal flip + in-trade re-analysis (v3.6): the brain re-judges
+        #    THIS open position every cycle, not just at entry. Flipped
+        #    against while in real profit -> bank it now (no 2-flip wait).
+        #    Flipped against while underwater -> tighten the stop (once).
         if SIGNAL_FLIP_EXIT_ENABLED:
             df_full = self.get_bars(symbol)
             if df_full is not None:
@@ -1068,8 +1249,26 @@ class MultiSymbolPaperTrader:
                 if latest is not None:
                     result = self.meta_learner.get_signal(symbol, latest, timestamp=latest['timestamp'], mode='live')
                     current = result['signal']
+                    cur_q = result.get('quality', 0.0)
                     opposite = 'SELL' if side == 'LONG' else 'BUY'
                     if current == opposite:
+                        if cur_q >= config.MIN_SIGNAL_QUALITY and atr_profit >= config.FLIP_EXIT_PROFIT_ATR:
+                            return 'SIGNAL_FLIP_PROFIT'
+                        if (getattr(config, 'FLIP_TIGHTEN_UNDERWATER', True)
+                                and atr_profit < 0 and not self.flip_tightened[symbol]
+                                and cur_q >= config.MIN_SIGNAL_QUALITY):
+                            self.flip_tightened[symbol] = True
+                            tight = (price - 1.0 * atr) if side == 'LONG' else (price + 1.0 * atr)
+                            if side == 'LONG':
+                                self.stop_loss[symbol] = max(self.stop_loss[symbol], tight)
+                            else:
+                                self.stop_loss[symbol] = min(self.stop_loss[symbol], tight)
+                            send_telegram(f"⚠️ {symbol}: brain flipped {current} (q={cur_q:.2f}) against your "
+                                          f"{side} while underwater - stop tightened to 1 ATR "
+                                          f"(${self.stop_loss[symbol]:.2f})", 'warning')
+                        elif self.flip_count[symbol] == 0 and atr_profit >= 0:
+                            send_telegram(f"⚠️ {symbol}: brain flipped {current} (q={cur_q:.2f}) against your "
+                                          f"{side} at +{atr_profit:.1f} ATR - watching closely", 'info')
                         self.flip_count[symbol] += 1
                         if self.flip_count[symbol] >= SIGNAL_FLIP_CONFIRM:
                             self.flip_count[symbol] = 0
@@ -1265,7 +1464,7 @@ class MultiSymbolPaperTrader:
                                 continue
                             side, quality, _reason = self.check_entry(symbol)
                             if side and quality >= config.MIN_SIGNAL_QUALITY:
-                                self.enter_position(symbol, side, quality)
+                                self.enter_position(symbol, side, quality, _reason)
                     except Exception as e:
                         logger.error(f"{symbol} cycle error: {e}")
 

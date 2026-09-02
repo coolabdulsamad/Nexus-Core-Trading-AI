@@ -106,7 +106,8 @@ class GlobalConfig:
 
     # ----- Entry quality gate -----
     ENTRY_CONVICTION_MARGIN = 0.015      # min |prob - 0.5|
-    MIN_SIGNAL_QUALITY = 0.20            # composite quality floor (0..1) to allow any trade
+    MIN_SIGNAL_QUALITY = 0.35            # v3.6: was 0.20 - the 0.20-0.24 "weak" band had no edge (PF 0.59 week)
+    QUALITY_MEMORY_REF_N = 80            # v3.6: quality is scaled by min(1, n/this) - thin memories can't enter
 
     # ----- Signal-strength position sizing (quality tiers) -----
     QUALITY_STRONG = 0.60                # quality >= this -> strong tier
@@ -117,6 +118,24 @@ class GlobalConfig:
     NOTIONAL_CAP_PCT = 0.75              # max notional per position, % of per-symbol capital
     NOTIONAL_CAP_ABS = 75000             # absolute $ cap per position
 
+    # ----- v3.6: entry analysis gates -----
+    # Evidence (Aug 27 - Sep 2 week): every loser came from the same cluster -
+    # BUY in regime=trend_down with fearful sentiment on a thin (n=35) memory.
+    # These gates make the brain prove the setup before money moves.
+    SENTIMENT_VETO_LONG = -0.60          # sent <= this -> no LONG (extreme fear)
+    SENTIMENT_VETO_SHORT = 0.60          # sent >= this -> no SHORT (extreme euphoria)
+    TOXIC_REGIME_SENT = -0.30            # regime=trend_down AND sent <= this -> veto LONG at ANY quality
+    TREND_REGIME_MIN_QUALITY = 0.60      # LONG in trend_down (SHORT in trend_up) must be STRONG-tier
+    CRYPTO_MOMENTUM_GATE = True          # crypto LONG needs price > sma200 AND 24h return > 0
+    SESSION_OPEN_NO_ENTRY_MINUTES = 60   # no stock entries in the first 60 min of the US session
+    ORDER_FILL_TIMEOUT_SECONDS = 90      # was 30s - 4 orders died unfilled at the volatile open
+
+    # ----- v3.6: loss cooldowns (the ETH 3-stops-in-7h fix) -----
+    COOLDOWN_AFTER_CLOSE_BARS = 3        # was 1 (5 min) - ETH re-entered 10 min after a stop
+    LOSS_COOLDOWN_HOURS = 24             # after a STOP_LOSS, symbol is banned this long
+    REPEAT_LOSS_WINDOW_DAYS = 7          # 2 stop-outs inside this window ...
+    REPEAT_LOSS_COOLDOWN_HOURS = 72      # ... bans the symbol this long
+
     # ----- Trade structure (1h recalibration) -----
     # 1h ATR is ~3-4x the 5-min ATR, so stops get tighter in ATR units:
     # SL 2xATR, TP 3xATR (R:R 1.5), breakeven at 1.5xATR.
@@ -125,8 +144,8 @@ class GlobalConfig:
     BREAKEVEN_ATR_MULTIPLE = 1.5         # move stop to entry after 1.5 x ATR profit
     SLIPPAGE_BPS = 0.0005
     COMMISSION_BPS = 0.0003
-    TIME_LIMIT_BARS = 8                  # full exit after 8 hourly bars (8h = 2x horizon)
-    COOLDOWN_BARS = 1
+    TIME_LIMIT_BARS = 16                 # v3.6: was 8 - TP needs 3 ATR, unreachable in 8h on crypto
+    COOLDOWN_BARS = 3                  # v3.6: was 1 (see COOLDOWN_AFTER_CLOSE_BARS)
 
     # ----- SMA exit (DISABLED) -----
     # Structurally guaranteed-loss exit (entries require price beyond the
@@ -140,16 +159,31 @@ class GlobalConfig:
     DAILY_PROFIT_TARGET_PCT = 0.02       # +2% day -> stop opening new trades (0 = disabled)
     DAILY_TARGET_LOCK_BREAKEVEN = True   # when target hit, move open stops to breakeven
 
-    # ----- Profit locking (live) -----
-    ENABLE_PARTIAL_TAKE_PROFIT = True
+    # ----- Profit locking (v3.6 rebuild) -----
+    # The old stack armed the retracement lock at +0.7 ATR and exited at +0.5
+    # ATR: winners were cut to ~+$28 crumbs (median hold 1.6h) while losers
+    # ran the full -2 ATR stop. Breakeven/trailing NEVER fired all week.
+    # New stack: scale out, ratchet real profit, trail wide, lock 60% of peak.
+    ENABLE_PARTIAL_TAKE_PROFIT = False   # replaced by SCALE_OUT below
     PARTIAL_TP_THRESHOLD = 0.60
     PARTIAL_CLOSE_PCT = 0.50
-    ENABLE_TRAILING_TP = True
+    ENABLE_TRAILING_TP = False           # replaced by the v3.6 trailing stop
     TRAILING_TP_ATR_TRIGGER = 3.0
     TRAILING_TP_DISTANCE_ATR = 1.5
     ENABLE_PROFIT_DRAWDOWN_PROTECTION = True
-    RETRACEMENT_HIGH_THRESHOLD = 0.70
-    RETRACEMENT_LOCK_THRESHOLD = 0.50
+    RETRACEMENT_ARM_ATR = 2.0            # arm the lock only after +2 ATR peak (was 0.70)
+    RETRACEMENT_KEEP_PCT = 0.60          # exit if profit falls to 60% of peak (was fixed 0.50 ATR)
+    PROFIT_RATCHET_ATR = 1.5             # at +1.5 ATR the stop ratchets up ...
+    RATCHET_LOCK_ATR = 0.50              # ... to entry + 0.5 ATR (locks real money, not breakeven)
+    TRAILING_STOP_ACTIVATE_ATR = 2.5     # hard trailing starts at +2.5 ATR (was 4.0 - never fired)
+    TRAILING_STOP_DISTANCE_ATR = 2.5     # trail 2.5 ATR behind the peak (was 6.0 - never mattered)
+    SCALE_OUT_ENABLED = True             # sell 1/3 at +1 ATR and 1/3 at +2 ATR, trail the rest
+    SCALE_OUT_1_ATR = 1.0
+    SCALE_OUT_2_ATR = 2.0
+    SCALE_OUT_PCT = 0.33
+    # In-trade re-analysis: the brain re-judges every open position each cycle
+    FLIP_EXIT_PROFIT_ATR = 0.5           # brain flips against + profit >= 0.5 ATR -> exit NOW (no 2-flip wait)
+    FLIP_TIGHTEN_UNDERWATER = True       # brain flips against while underwater -> tighten stop to 1 ATR
     ENABLE_TIME_PARTIAL = True
     TIME_PARTIAL_BARS = 12
     TIME_PARTIAL_PROFIT_ATR = 0.5
