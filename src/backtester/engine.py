@@ -24,6 +24,11 @@ Honest backtesting:
   (arm +2 ATR, keep 60% of peak), in-trade re-analysis (flip against in
   profit -> exit now; flip against underwater -> tighten stop once;
   otherwise 2-flip confirm), time limit 16 bars.
+- v3.6.1 (post first-run fixes): the broker simulator's OWN hidden trailing
+  stop (1.5/0.8 ATR) is now disabled (atr=None) - it was pre-empting the v3.6
+  stack, the exact live/backtest divergence v3.6 was built to kill. Sentiment
+  vetoes now read point-in-time feature_cache sentiment (the backtest reason
+  string always reports sent=+0.00). Equity CSV path sanitized for crypto.
   KNOWN DIFFERENCE vs live: scale-outs (1/3 @ +1 ATR, 1/3 @ +2 ATR) and the
   time-based partial are live-only - the broker simulator closes whole
   positions. Omitting them is CONSERVATIVE for winners (backtest keeps full
@@ -301,13 +306,18 @@ class BacktesterEngine:
             # 1. Cooldown
             if self.cooldown > 0:
                 self.cooldown -= 1
-                self.broker.check_positions(t, row['high'], row['low'], price, atr)
+                # v3.6.1: atr=None on PURPOSE - BrokerSimulator.check_positions
+                # runs its OWN hidden trailing stop (1.5/0.8 ATR) when atr is
+                # passed. Live has no such thing; the v3.6 engine stack owns
+                # the stop. SL/TP detection does not need atr.
+                self.broker.check_positions(t, row['high'], row['low'], price, None)
                 self._record_new_closes(t)
                 self._log_equity(t, price, 'HOLD', 0.5, 0.0)
                 continue
 
-            # 2. SL/TP + trailing (intrabar)
-            self.broker.check_positions(t, row['high'], row['low'], price, atr)
+            # 2. SL/TP (intrabar) - atr=None: broker's internal trailing
+            # disabled, the v3.6 engine stack owns the stop (parity with live).
+            self.broker.check_positions(t, row['high'], row['low'], price, None)
             self._record_new_closes(t)
 
             # 3. AI signal (point-in-time)
@@ -342,10 +352,13 @@ class BacktesterEngine:
                     regime = r_regime or (row.get('regime_label')
                                           if isinstance(row.get('regime_label'), str)
                                           and row.get('regime_label') else 'unknown')
-                    sent = r_sent
-                    if sent is None:
-                        s = row.get('sentiment_score')
-                        sent = float(s) if s is not None and pd.notna(s) else 0.0
+                    s = row.get('sentiment_score')
+                    if s is not None and pd.notna(s):
+                        sent = float(s)            # point-in-time cache (what the brain sees)
+                    elif r_sent is not None:
+                        sent = r_sent
+                    else:
+                        sent = 0.0
                     ref_n = getattr(config, 'QUALITY_MEMORY_REF_N', 80)
                     eff_quality = quality * min(1.0, (n_mem / ref_n) if ref_n else 1.0) \
                         if n_mem else quality * 0.5
@@ -515,7 +528,10 @@ class BacktesterEngine:
                 print(f"  {reason:<20} n={r['n']:<4} win%={r['wins']/r['n']*100:5.1f}  pnl=${r['pnl']:+,.2f}")
         print("=" * 60)
 
-        pd.DataFrame(self.broker.equity_curve).to_csv(f"logs/equity_ai_{self.symbol}.csv", index=False)
+        import os
+        os.makedirs('logs', exist_ok=True)
+        safe_symbol = self.symbol.replace('/', '_')
+        pd.DataFrame(self.broker.equity_curve).to_csv(f"logs/equity_ai_{safe_symbol}.csv", index=False)
 
 
 if __name__ == "__main__":
