@@ -602,7 +602,20 @@ class MultiSymbolPaperTrader:
         self.daily_trades[symbol].append({'time': datetime.now(timezone.utc), 'pnl': pnl, 'reason': reason})
         # v3.6: richer exit math, captured BEFORE state reset
         entry = self.entry_price[symbol]
-        atr = self.atr[symbol] or 0.0
+        # ATR for the exit report: fetched fresh (there is no tracked self.atr;
+        # a missing/invalid ATR must NEVER break a close - the trade is done).
+        atr = 0.0
+        try:
+            _df = self.get_bars(symbol)
+            if _df is not None and not _df.empty:
+                _feats = calculate_all_indicators(
+                    _df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy())
+                if not _feats.empty:
+                    atr = float(_feats.iloc[-1]['atr_14'])
+        except Exception:
+            atr = 0.0
+        if atr <= 0 or np.isnan(atr):
+            atr = 0.0
         peak_px = self.highest_price[symbol] if broker_side == 'LONG' else self.lowest_price[symbol]
         peak_atr = 0.0
         if atr > 0 and entry > 0 and peak_px:
