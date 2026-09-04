@@ -64,6 +64,7 @@ TIME_LIMIT_ENABLED = True
 ENTRY_BAR_CONFIRM = getattr(config, 'ENTRY_BAR_CONFIRM_ENABLED', True)
 ENTRY_BAR_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_BAR_CONFIRM_TOLERANCE_ATR', 0.5)
 ENTRY_VWAP_CONFIRM = getattr(config, 'ENTRY_VWAP_CONFIRM_ENABLED', True)
+ENTRY_VWAP_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_VWAP_CONFIRM_TOLERANCE_ATR', 0.5)
 ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
 ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
 ENTRY_ADX_MIN = getattr(config, 'ENTRY_ADX_MIN', 20.0)
@@ -216,9 +217,11 @@ class BacktesterEngine:
                 return False, 'bar_confirm'
 
         if ENTRY_VWAP_CONFIRM and dist_vwap is not None and pd.notna(dist_vwap):
-            if side0 == 'LONG' and dist_vwap < 0:
+            # v3.6.5: tolerance mode - only block when DEEPLY on the wrong side
+            # of VWAP (strict side-agreement killed shallow dip-buys, 52% of blocks)
+            if side0 == 'LONG' and dist_vwap < -ENTRY_VWAP_CONFIRM_TOL_ATR:
                 return False, 'vwap_confirm'
-            if side0 == 'SHORT' and dist_vwap > 0:
+            if side0 == 'SHORT' and dist_vwap > ENTRY_VWAP_CONFIRM_TOL_ATR:
                 return False, 'vwap_confirm'
 
         if ENTRY_NO_CHASE and ret_1 is not None and atr_pct is not None \

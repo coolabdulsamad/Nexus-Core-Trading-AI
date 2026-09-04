@@ -239,6 +239,7 @@ TRAIL_ALERT_STEP_ATR = getattr(config, 'TRAIL_ALERT_STEP_ATR', 0.25)
 ENTRY_BAR_CONFIRM = getattr(config, 'ENTRY_BAR_CONFIRM_ENABLED', True)
 ENTRY_BAR_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_BAR_CONFIRM_TOLERANCE_ATR', 0.5)
 ENTRY_VWAP_CONFIRM = getattr(config, 'ENTRY_VWAP_CONFIRM_ENABLED', True)
+ENTRY_VWAP_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_VWAP_CONFIRM_TOLERANCE_ATR', 0.5)
 ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
 ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
 ENTRY_ADX_MIN = getattr(config, 'ENTRY_ADX_MIN', 20.0)
@@ -249,7 +250,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.4"
+TRADER_VERSION = "v3.6.5"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -1005,10 +1006,12 @@ class MultiSymbolPaperTrader:
                 return False, f"bar confirm failed (last bar {ret_1:+.2%} - strong counter-bar vs SHORT)"
 
         if ENTRY_VWAP_CONFIRM and dist_vwap is not None and not np.isnan(dist_vwap):
-            if side0 == 'LONG' and dist_vwap < 0:
-                return False, f"below VWAP ({dist_vwap:+.1f} ATR) - sellers in control today"
-            if side0 == 'SHORT' and dist_vwap > 0:
-                return False, f"above VWAP ({dist_vwap:+.1f} ATR) - buyers in control today"
+            # v3.6.5: tolerance mode - only block when DEEPLY on the wrong side
+            # of VWAP (strict side-agreement killed shallow dip-buys, 52% of blocks)
+            if side0 == 'LONG' and dist_vwap < -ENTRY_VWAP_CONFIRM_TOL_ATR:
+                return False, f"deep below VWAP ({dist_vwap:+.1f} ATR) - sellers firmly in control today"
+            if side0 == 'SHORT' and dist_vwap > ENTRY_VWAP_CONFIRM_TOL_ATR:
+                return False, f"deep above VWAP ({dist_vwap:+.1f} ATR) - buyers firmly in control today"
 
         if ENTRY_NO_CHASE and ret_1 is not None and atr_pct is not None \
                 and not np.isnan(ret_1) and not np.isnan(atr_pct) and atr_pct > 0:

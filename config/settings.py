@@ -151,6 +151,11 @@ class GlobalConfig:
     # (more than this many x ATR). 0.5 = block only real counter-bars; 0 = strict.
     ENTRY_BAR_CONFIRM_TOLERANCE_ATR = 0.5
     ENTRY_VWAP_CONFIRM_ENABLED = True    # LONG only above today's VWAP, SHORT only below (buyers/sellers in control)
+    # v3.6.5: measured after the bar-confirm fix - strict VWAP side-agreement
+    # became the #1 blocker (401 of 777 blocks, 52%). The brain buys dips, and
+    # dips often sit slightly BELOW VWAP. Tolerance: only block when price is
+    # DEEPLY on the wrong side of VWAP (more than this many ATR). 0 = strict.
+    ENTRY_VWAP_CONFIRM_TOLERANCE_ATR = 0.5
     ENTRY_NO_CHASE_ENABLED = True        # skip if the last bar spiked > NO_CHASE_MAX_RANGE_ATR x ATR (never chase)
     ENTRY_NO_CHASE_MAX_RANGE_ATR = 1.5
     ENTRY_ADX_MIN = 20.0                 # with-trend entries need a real trend (ADX >= this; 0 = off)
