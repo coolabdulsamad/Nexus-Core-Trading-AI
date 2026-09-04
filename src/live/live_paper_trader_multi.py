@@ -237,6 +237,7 @@ TRAIL_ALERT_STEP_ATR = getattr(config, 'TRAIL_ALERT_STEP_ATR', 0.25)
 # the protective work. The confirmation layer makes the CURRENT tape agree
 # with the brain's vote before money moves.
 ENTRY_BAR_CONFIRM = getattr(config, 'ENTRY_BAR_CONFIRM_ENABLED', True)
+ENTRY_BAR_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_BAR_CONFIRM_TOLERANCE_ATR', 0.5)
 ENTRY_VWAP_CONFIRM = getattr(config, 'ENTRY_VWAP_CONFIRM_ENABLED', True)
 ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
 ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
@@ -248,7 +249,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.3"
+TRADER_VERSION = "v3.6.4"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -994,10 +995,14 @@ class MultiSymbolPaperTrader:
             return False, f"volatility spike (ATR {vol_ratio:.1f}x its average > {VOL_RATIO_MAX:.1f})"
 
         if ENTRY_BAR_CONFIRM and ret_1 is not None and not np.isnan(ret_1):
-            if side0 == 'LONG' and ret_1 <= 0:
-                return False, f"bar confirm failed (last bar {ret_1:+.2%} - tape not with the LONG)"
-            if side0 == 'SHORT' and ret_1 >= 0:
-                return False, f"bar confirm failed (last bar {ret_1:+.2%} - tape not with the SHORT)"
+            # v3.6.4: tolerance mode - only a STRONG counter-bar blocks the entry
+            # (strict sign-agreement killed 77% of valid dip-buy / rip-sell signals)
+            tol = ENTRY_BAR_CONFIRM_TOL_ATR * atr_pct \
+                if (atr_pct is not None and not np.isnan(atr_pct) and atr_pct > 0) else 0.0
+            if side0 == 'LONG' and ret_1 <= -tol:
+                return False, f"bar confirm failed (last bar {ret_1:+.2%} - strong counter-bar vs LONG)"
+            if side0 == 'SHORT' and ret_1 >= tol:
+                return False, f"bar confirm failed (last bar {ret_1:+.2%} - strong counter-bar vs SHORT)"
 
         if ENTRY_VWAP_CONFIRM and dist_vwap is not None and not np.isnan(dist_vwap):
             if side0 == 'LONG' and dist_vwap < 0:

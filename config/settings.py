@@ -144,6 +144,12 @@ class GlobalConfig:
     # The brain votes from memory; these make the CURRENT tape agree before
     # money moves. Each is independently switchable.
     ENTRY_BAR_CONFIRM_ENABLED = True     # last closed bar must move WITH the signal (LONG: ret_1 > 0)
+    # v3.6.4: measured over 6 symbols x 3 months - strict sign-agreement blocked
+    # 77% of otherwise-valid entries (747 of 970) because the brain often buys
+    # dips / sells rips, so the last bar is frequently AGAINST the signal.
+    # Tolerance: only block when the last bar moves STRONGLY against the signal
+    # (more than this many x ATR). 0.5 = block only real counter-bars; 0 = strict.
+    ENTRY_BAR_CONFIRM_TOLERANCE_ATR = 0.5
     ENTRY_VWAP_CONFIRM_ENABLED = True    # LONG only above today's VWAP, SHORT only below (buyers/sellers in control)
     ENTRY_NO_CHASE_ENABLED = True        # skip if the last bar spiked > NO_CHASE_MAX_RANGE_ATR x ATR (never chase)
     ENTRY_NO_CHASE_MAX_RANGE_ATR = 1.5

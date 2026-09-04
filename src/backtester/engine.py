@@ -62,6 +62,7 @@ TIME_LIMIT_ENABLED = True
 # Measured over 39,570 live brain readings: max q EVER = 0.480, so the old
 # 0.60 STRONG gates could never fire; recalibrated to 0.45 in settings.
 ENTRY_BAR_CONFIRM = getattr(config, 'ENTRY_BAR_CONFIRM_ENABLED', True)
+ENTRY_BAR_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_BAR_CONFIRM_TOLERANCE_ATR', 0.5)
 ENTRY_VWAP_CONFIRM = getattr(config, 'ENTRY_VWAP_CONFIRM_ENABLED', True)
 ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
 ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
@@ -205,9 +206,13 @@ class BacktesterEngine:
         adx = row.get('adx_14')
 
         if ENTRY_BAR_CONFIRM and ret_1 is not None and pd.notna(ret_1):
-            if side0 == 'LONG' and ret_1 <= 0:
+            # v3.6.4: tolerance mode - only a STRONG counter-bar blocks the entry
+            # (strict sign-agreement killed 77% of valid dip-buy / rip-sell signals)
+            tol = ENTRY_BAR_CONFIRM_TOL_ATR * atr_pct \
+                if (atr_pct is not None and pd.notna(atr_pct) and atr_pct > 0) else 0.0
+            if side0 == 'LONG' and ret_1 <= -tol:
                 return False, 'bar_confirm'
-            if side0 == 'SHORT' and ret_1 >= 0:
+            if side0 == 'SHORT' and ret_1 >= tol:
                 return False, 'bar_confirm'
 
         if ENTRY_VWAP_CONFIRM and dist_vwap is not None and pd.notna(dist_vwap):
