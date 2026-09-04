@@ -120,7 +120,9 @@ class BacktesterEngine:
                            blocked_session_open=0, blocked_sentiment=0,
                            blocked_toxic_combo=0, blocked_counter_regime=0,
                            blocked_crypto_momentum=0, blocked_loss_cooldown=0,
-                           blocked_confirmation=0)
+                           blocked_confirmation=0,
+                           conf_bar_confirm=0, conf_vwap_confirm=0,
+                           conf_no_chase=0, conf_adx=0)
 
     def fetch_data(self) -> pd.DataFrame:
         suffix = config.BAR_SUFFIX
@@ -448,6 +450,7 @@ class BacktesterEngine:
                         ok, _why = self._entry_confirmation(row, side0, price, sma)
                         if not ok:
                             self.funnel['blocked_confirmation'] += 1
+                            self.funnel[f'conf_{_why}'] += 1
                             proceed = False
 
                 if proceed:
@@ -566,6 +569,7 @@ class BacktesterEngine:
         print(f"  Blocked loss-cooldown:  {f['blocked_loss_cooldown']:<6} Blocked trend-opposed: {f['blocked_trend_opposed']}")
         print(f"  Blocked conviction:     {f['blocked_conviction']:<6} Blocked volatility: {f['blocked_volatility']}")
         print(f"  Blocked confirmation:   {f['blocked_confirmation']:<6} (v3.6.3: bar/VWAP/no-chase/ADX)")
+        print(f"    -> bar: {f['conf_bar_confirm']:<5} vwap: {f['conf_vwap_confirm']:<5} no-chase: {f['conf_no_chase']:<5} adx: {f['conf_adx']}")
         print(f"  Blocked daily-guard:    {f['blocked_daily_guard']:<6} Blocked size: {f['blocked_size']}  Crypto shorts skipped: {f['blocked_crypto_short']}")
         if trades:
             avg_w = np.mean([t['pnl'] for t in wins]) if wins else 0
