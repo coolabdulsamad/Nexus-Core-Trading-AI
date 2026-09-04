@@ -110,7 +110,9 @@ class GlobalConfig:
     QUALITY_MEMORY_REF_N = 80            # v3.6: quality is scaled by min(1, n/this) - thin memories can't enter
 
     # ----- Signal-strength position sizing (quality tiers) -----
-    QUALITY_STRONG = 0.60                # quality >= this -> strong tier
+    # v3.6.3: was 0.60 - unreachable (max q ever observed = 0.480), so the
+    # STRONG tier never existed and everything was sized MEDIUM/WEAK.
+    QUALITY_STRONG = 0.45                # quality >= this -> strong tier (~p95 of observed range)
     QUALITY_MEDIUM = 0.35                # quality >= this -> medium tier (below -> weak tier)
     RISK_PCT_STRONG = 0.020              # 2.0% of slice risked on strong signals
     RISK_PCT_MEDIUM = 0.010              # 1.0%
@@ -125,10 +127,27 @@ class GlobalConfig:
     SENTIMENT_VETO_LONG = -0.60          # sent <= this -> no LONG (extreme fear)
     SENTIMENT_VETO_SHORT = 0.60          # sent >= this -> no SHORT (extreme euphoria)
     TOXIC_REGIME_SENT = -0.30            # regime=trend_down AND sent <= this -> veto LONG at ANY quality
-    TREND_REGIME_MIN_QUALITY = 0.60      # LONG in trend_down (SHORT in trend_up) must be STRONG-tier
+    # v3.6.3: was 0.60 - DEAD GATE. Measured over 39,570 live brain readings:
+    # max q EVER observed is 0.480, so a 0.60 gate could never fire. 0.45 is
+    # ~p95 of the observed range = genuinely "strong" but actually reachable.
+    TREND_REGIME_MIN_QUALITY = 0.45      # LONG in trend_down (SHORT in trend_up) must be STRONG-tier
     CRYPTO_MOMENTUM_GATE = True          # crypto LONG needs price > sma200 AND 24h return > 0
+    # v3.6.3: crypto quality runs structurally lower (p90 = 0.21 vs stocks 0.46;
+    # no news feed, different memory). With the 0.35 floor crypto could never
+    # trade. Crypto gets its own floor - the momentum gate + bar confirmations
+    # below do the protective work instead.
+    CRYPTO_MIN_SIGNAL_QUALITY = 0.25     # quality floor for crypto entries (stocks use MIN_SIGNAL_QUALITY)
     SESSION_OPEN_NO_ENTRY_MINUTES = 60   # no stock entries in the first 60 min of the US session
     ORDER_FILL_TIMEOUT_SECONDS = 90      # was 30s - 4 orders died unfilled at the volatile open
+
+    # ----- v3.6.3: entry confirmation (the "analyse the bars before entering" layer) -----
+    # The brain votes from memory; these make the CURRENT tape agree before
+    # money moves. Each is independently switchable.
+    ENTRY_BAR_CONFIRM_ENABLED = True     # last closed bar must move WITH the signal (LONG: ret_1 > 0)
+    ENTRY_VWAP_CONFIRM_ENABLED = True    # LONG only above today's VWAP, SHORT only below (buyers/sellers in control)
+    ENTRY_NO_CHASE_ENABLED = True        # skip if the last bar spiked > NO_CHASE_MAX_RANGE_ATR x ATR (never chase)
+    ENTRY_NO_CHASE_MAX_RANGE_ATR = 1.5
+    ENTRY_ADX_MIN = 20.0                 # with-trend entries need a real trend (ADX >= this; 0 = off)
 
     # ----- v3.6: loss cooldowns (the ETH 3-stops-in-7h fix) -----
     COOLDOWN_AFTER_CLOSE_BARS = 3        # was 1 (5 min) - ETH re-entered 10 min after a stop

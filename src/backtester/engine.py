@@ -58,6 +58,16 @@ SIGNAL_FLIP_EXIT_ENABLED = True
 SIGNAL_FLIP_CONFIRM = 2
 TIME_LIMIT_ENABLED = True
 
+# v3.6.3: entry confirmation layer + data-calibrated gates (mirrors live).
+# Measured over 39,570 live brain readings: max q EVER = 0.480, so the old
+# 0.60 STRONG gates could never fire; recalibrated to 0.45 in settings.
+ENTRY_BAR_CONFIRM = getattr(config, 'ENTRY_BAR_CONFIRM_ENABLED', True)
+ENTRY_VWAP_CONFIRM = getattr(config, 'ENTRY_VWAP_CONFIRM_ENABLED', True)
+ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
+ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
+ENTRY_ADX_MIN = getattr(config, 'ENTRY_ADX_MIN', 20.0)
+CRYPTO_MIN_SIGNAL_QUALITY = getattr(config, 'CRYPTO_MIN_SIGNAL_QUALITY', 0.25)
+
 
 # ---------------------------------------------------------------------------
 # Defensive accessors - BrokerSimulator position dict keys are not guaranteed
@@ -109,7 +119,8 @@ class BacktesterEngine:
                            blocked_daily_guard=0, blocked_size=0, entries=0,
                            blocked_session_open=0, blocked_sentiment=0,
                            blocked_toxic_combo=0, blocked_counter_regime=0,
-                           blocked_crypto_momentum=0, blocked_loss_cooldown=0)
+                           blocked_crypto_momentum=0, blocked_loss_cooldown=0,
+                           blocked_confirmation=0)
 
     def fetch_data(self) -> pd.DataFrame:
         suffix = config.BAR_SUFFIX
@@ -177,6 +188,43 @@ class BacktesterEngine:
             ret_24h = price / float(self.df.iloc[idx - 24]['close']) - 1.0
             return ret_24h > 0
         return False
+
+    def _min_quality(self) -> float:
+        """v3.6.3: crypto gets its own (lower) quality floor - mirrors live."""
+        return CRYPTO_MIN_SIGNAL_QUALITY if '/' in self.symbol else config.MIN_SIGNAL_QUALITY
+
+    def _entry_confirmation(self, row, side0: str, price: float, sma: float):
+        """v3.6.3: the tape must agree with the brain's vote (mirrors live).
+        The volatility filter is NOT repeated here - the engine already
+        enforces it via vol_ok / blocked_volatility."""
+        ret_1 = row.get('ret_1')
+        atr_pct = row.get('atr_pct')
+        dist_vwap = row.get('dist_vwap')
+        adx = row.get('adx_14')
+
+        if ENTRY_BAR_CONFIRM and ret_1 is not None and pd.notna(ret_1):
+            if side0 == 'LONG' and ret_1 <= 0:
+                return False, 'bar_confirm'
+            if side0 == 'SHORT' and ret_1 >= 0:
+                return False, 'bar_confirm'
+
+        if ENTRY_VWAP_CONFIRM and dist_vwap is not None and pd.notna(dist_vwap):
+            if side0 == 'LONG' and dist_vwap < 0:
+                return False, 'vwap_confirm'
+            if side0 == 'SHORT' and dist_vwap > 0:
+                return False, 'vwap_confirm'
+
+        if ENTRY_NO_CHASE and ret_1 is not None and atr_pct is not None \
+                and pd.notna(ret_1) and pd.notna(atr_pct) and atr_pct > 0:
+            if abs(ret_1) > ENTRY_NO_CHASE_MAX_RANGE_ATR * atr_pct:
+                return False, 'no_chase'
+
+        if ENTRY_ADX_MIN > 0 and adx is not None and pd.notna(adx):
+            with_trend = ((side0 == 'LONG' and price > sma) or (side0 == 'SHORT' and price < sma))
+            if with_trend and adx < ENTRY_ADX_MIN:
+                return False, 'adx'
+
+        return True, ''
 
     def _loss_cooldown_active(self, t) -> bool:
         """24h ban after a stop-out; 72h ban after 2 stops inside 7 days."""
@@ -366,7 +414,7 @@ class BacktesterEngine:
                     veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.60)
                     veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.60)
                     toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.30)
-                    regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.60)
+                    regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45)
 
                     if self._session_open_blackout(t):
                         self.funnel['blocked_session_open'] += 1
@@ -395,6 +443,13 @@ class BacktesterEngine:
                         self.funnel['blocked_crypto_momentum'] += 1
                         proceed = False
 
+                    # v3.6.3: the tape itself must agree (bar / VWAP / no-chase / ADX)
+                    if proceed:
+                        ok, _why = self._entry_confirmation(row, side0, price, sma)
+                        if not ok:
+                            self.funnel['blocked_confirmation'] += 1
+                            proceed = False
+
                 if proceed:
                     with_trend = ((signal == 'BUY' and price > row['sma_200']) or
                                   (signal == 'SELL' and price < row['sma_200']))
@@ -409,7 +464,7 @@ class BacktesterEngine:
                             proceed = False
                         else:
                             adj = eff_quality * COUNTER_TREND_PENALTY
-                            if adj >= config.MIN_SIGNAL_QUALITY:
+                            if adj >= self._min_quality():
                                 self.funnel['counter_trend_allowed'] += 1
                                 eff_quality = adj
                             else:
@@ -423,7 +478,7 @@ class BacktesterEngine:
                         self.funnel['blocked_conviction'] += 1
                     elif not vol_ok:
                         self.funnel['blocked_volatility'] += 1
-                    elif eff_quality < config.MIN_SIGNAL_QUALITY:
+                    elif eff_quality < self._min_quality():
                         self.funnel['blocked_quality'] += 1
                     elif not can_trade:
                         self.funnel['blocked_daily_guard'] += 1
@@ -506,10 +561,11 @@ class BacktesterEngine:
         print(f"  Entries taken:          {f['entries']:<6} (counter-trend allowed: {f['counter_trend_allowed']})")
         print(f"  Blocked by quality:     {f['blocked_quality']:<6} (incl. counter-trend x{COUNTER_TREND_PENALTY} penalty)")
         print(f"  Blocked sentiment veto: {f['blocked_sentiment']:<6} Blocked toxic combo: {f['blocked_toxic_combo']}")
-        print(f"  Blocked counter-regime: {f['blocked_counter_regime']:<6} (needs eff_q >= {getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.60):.2f})")
+        print(f"  Blocked counter-regime: {f['blocked_counter_regime']:<6} (needs eff_q >= {getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45):.2f})")
         print(f"  Blocked crypto momentum:{f['blocked_crypto_momentum']:<6} Blocked session-open: {f['blocked_session_open']}")
         print(f"  Blocked loss-cooldown:  {f['blocked_loss_cooldown']:<6} Blocked trend-opposed: {f['blocked_trend_opposed']}")
         print(f"  Blocked conviction:     {f['blocked_conviction']:<6} Blocked volatility: {f['blocked_volatility']}")
+        print(f"  Blocked confirmation:   {f['blocked_confirmation']:<6} (v3.6.3: bar/VWAP/no-chase/ADX)")
         print(f"  Blocked daily-guard:    {f['blocked_daily_guard']:<6} Blocked size: {f['blocked_size']}  Crypto shorts skipped: {f['blocked_crypto_short']}")
         if trades:
             avg_w = np.mean([t['pnl'] for t in wins]) if wins else 0

@@ -116,6 +116,20 @@ v3.6 (the "no edge" post-mortem, Sep 2 - one week of evidence):
 - Telegram: entries show the full "why" (q, n, regime, sentiment, vetoes);
   ratchets, scale-outs and flips against open positions alert immediately;
   exits report R-multiple, hold time and % of peak kept.
+
+v3.6.2 (observability): position heartbeat card every 4 bars, trailing-stop
+move alerts, retracement-arm alert, per-cycle REANALYSIS log lines.
+
+v3.6.3 (data-calibrated gates + entry confirmation):
+- Measured over 39,570 live brain readings: max q EVER observed = 0.480, so
+  the 0.60 STRONG gates could never fire. Recalibrated: counter-regime STRONG
+  and the STRONG sizing tier now 0.45 (~p95 of observed). Crypto gets its own
+  quality floor (0.25) - its q distribution is structurally lower.
+- ENTRY CONFIRMATION LAYER: the brain votes from memory, then the current
+  tape must agree before money moves: last closed bar with the signal, price
+  on the right side of VWAP, no chasing spike bars (>1.5x ATR), with-trend
+  entries need ADX >= 20, and the volatility filter (ATR spike vs its own
+  average) is now actually enforced (it existed in config but was never wired).
 """
 import os
 import sys
@@ -214,11 +228,27 @@ TIME_LIMIT_BARS = config.TIME_LIMIT_BARS   # 16 hours (v3.6)
 # v3.6.2 observability: position heartbeats + trailing-move alerts
 POSITION_HEARTBEAT_BARS = getattr(config, 'POSITION_HEARTBEAT_BARS', 4)
 TRAIL_ALERT_STEP_ATR = getattr(config, 'TRAIL_ALERT_STEP_ATR', 0.25)
+
+# v3.6.3: entry confirmation layer + data-calibrated gates.
+# Measured over 39,570 live brain readings: max q EVER seen = 0.480, so the
+# old 0.60 "STRONG" gates could never fire (0 trades). Recalibrated to 0.45
+# (~p95 of observed). Crypto quality runs structurally lower (p90 = 0.21),
+# so crypto gets its own floor - the momentum gate + these confirmations do
+# the protective work. The confirmation layer makes the CURRENT tape agree
+# with the brain's vote before money moves.
+ENTRY_BAR_CONFIRM = getattr(config, 'ENTRY_BAR_CONFIRM_ENABLED', True)
+ENTRY_VWAP_CONFIRM = getattr(config, 'ENTRY_VWAP_CONFIRM_ENABLED', True)
+ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
+ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
+ENTRY_ADX_MIN = getattr(config, 'ENTRY_ADX_MIN', 20.0)
+CRYPTO_MIN_SIGNAL_QUALITY = getattr(config, 'CRYPTO_MIN_SIGNAL_QUALITY', 0.25)
+VOL_FILTER_ENABLED = getattr(config, 'VOLATILITY_FILTER_ENABLED', True)
+VOL_RATIO_MAX = getattr(config, 'VOLATILITY_RATIO_MAX', 3.0)
 COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.2"
+TRADER_VERSION = "v3.6.3"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -938,6 +968,55 @@ class MultiSymbolPaperTrader:
             return ret_24h > 0
         return False
 
+    def _min_quality(self, symbol: str) -> float:
+        """v3.6.3: crypto's quality distribution is structurally lower (no news
+        feed, different memory depth), so it gets its own floor; the momentum
+        gate + confirmation layer do the protective work for crypto."""
+        return CRYPTO_MIN_SIGNAL_QUALITY if self._is_crypto(symbol) else config.MIN_SIGNAL_QUALITY
+
+    def _entry_confirmation(self, symbol: str, side0: str, latest, price: float, sma: float):
+        """v3.6.3: the brain votes from memory - this layer makes the CURRENT
+        tape agree before money moves. Returns (ok, reason_if_blocked).
+        - bar confirm:   the last closed bar must move WITH the signal
+        - vwap confirm:  LONG only above today's VWAP (buyers in control)
+        - no-chase:      never enter right after a spike bar (> 1.5x ATR)
+        - adx:           with-trend entries need a real trend (ADX >= 20)
+        - vol filter:    no entries while ATR is spiking vs its own average
+        Every field is read defensively: a missing indicator never blocks."""
+        ret_1 = latest.get('ret_1')
+        atr_pct = latest.get('atr_pct')
+        dist_vwap = latest.get('dist_vwap')
+        adx = latest.get('adx_14')
+        vol_ratio = latest.get('volatility_ratio')
+
+        if VOL_FILTER_ENABLED and vol_ratio is not None and not np.isnan(vol_ratio) \
+                and vol_ratio > VOL_RATIO_MAX:
+            return False, f"volatility spike (ATR {vol_ratio:.1f}x its average > {VOL_RATIO_MAX:.1f})"
+
+        if ENTRY_BAR_CONFIRM and ret_1 is not None and not np.isnan(ret_1):
+            if side0 == 'LONG' and ret_1 <= 0:
+                return False, f"bar confirm failed (last bar {ret_1:+.2%} - tape not with the LONG)"
+            if side0 == 'SHORT' and ret_1 >= 0:
+                return False, f"bar confirm failed (last bar {ret_1:+.2%} - tape not with the SHORT)"
+
+        if ENTRY_VWAP_CONFIRM and dist_vwap is not None and not np.isnan(dist_vwap):
+            if side0 == 'LONG' and dist_vwap < 0:
+                return False, f"below VWAP ({dist_vwap:+.1f} ATR) - sellers in control today"
+            if side0 == 'SHORT' and dist_vwap > 0:
+                return False, f"above VWAP ({dist_vwap:+.1f} ATR) - buyers in control today"
+
+        if ENTRY_NO_CHASE and ret_1 is not None and atr_pct is not None \
+                and not np.isnan(ret_1) and not np.isnan(atr_pct) and atr_pct > 0:
+            if abs(ret_1) > ENTRY_NO_CHASE_MAX_RANGE_ATR * atr_pct:
+                return False, f"no-chase: last bar moved {abs(ret_1)/atr_pct:.1f}x ATR - entry would be chasing"
+
+        if ENTRY_ADX_MIN > 0 and adx is not None and not np.isnan(adx):
+            with_trend = ((side0 == 'LONG' and price > sma) or (side0 == 'SHORT' and price < sma))
+            if with_trend and adx < ENTRY_ADX_MIN:
+                return False, f"weak trend (ADX {adx:.0f} < {ENTRY_ADX_MIN:.0f})"
+
+        return True, ''
+
     def check_entry(self, symbol: str) -> Tuple[Optional[str], float, str]:
         if self._session_open_blackout(symbol):
             return None, 0.0, 'session_open_blackout'
@@ -973,7 +1052,7 @@ class MultiSymbolPaperTrader:
             veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.60)
             veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.60)
             toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.30)
-            regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.60)
+            regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45)
             if side0 == 'LONG' and sent <= veto_long:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment ({sent:+.2f} <= {veto_long:+.2f})")
                 return None, eff_quality, reason
@@ -997,6 +1076,11 @@ class MultiSymbolPaperTrader:
                 logger.info(f"{symbol} | BUY q={quality:.3f} BLOCKED: crypto momentum gate "
                             f"(need price > 200-bar avg AND 24h return > 0)")
                 return None, eff_quality, reason
+            # v3.6.3: the tape itself must agree (bar / VWAP / no-chase / ADX / vol filter)
+            ok, why = self._entry_confirmation(symbol, side0, latest, price, sma)
+            if not ok:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} eff={eff_quality:.3f} BLOCKED: {why}")
+                return None, eff_quality, reason
 
         # With-trend entries
         if signal == 'BUY' and price > sma:
@@ -1009,7 +1093,7 @@ class MultiSymbolPaperTrader:
 
         # Counter-trend (v3.2): allowed at reduced quality UNLESS the
         # short-term regime also disagrees (fighting both timeframes = veto).
-        if signal in ('BUY', 'SELL') and eff_quality >= config.MIN_SIGNAL_QUALITY:
+        if signal in ('BUY', 'SELL') and eff_quality >= self._min_quality(symbol):
             opposed = ((signal == 'SELL' and regime == 'trend_up') or
                        (signal == 'BUY' and regime == 'trend_down'))
             relation = 'above' if price > sma else 'below'
@@ -1018,9 +1102,9 @@ class MultiSymbolPaperTrader:
                             f"(price {relation} 200-bar avg, regime={regime or 'unknown'})")
                 return None, eff_quality, reason
             adj = eff_quality * COUNTER_TREND_PENALTY
-            if adj < config.MIN_SIGNAL_QUALITY:
+            if adj < self._min_quality(symbol):
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: counter-trend penalty "
-                            f"-> effective q={adj:.3f} below gate {config.MIN_SIGNAL_QUALITY:.2f}")
+                            f"-> effective q={adj:.3f} below gate {self._min_quality(symbol):.2f}")
                 return None, eff_quality, reason
             if signal == 'SELL' and self._is_crypto(symbol):
                 logger.info(f"{symbol} | SELL q={quality:.3f} skipped: crypto is long-only on Alpaca spot")
@@ -1550,7 +1634,7 @@ class MultiSymbolPaperTrader:
                             if not can_trade:
                                 continue
                             side, quality, _reason = self.check_entry(symbol)
-                            if side and quality >= config.MIN_SIGNAL_QUALITY:
+                            if side and quality >= self._min_quality(symbol):
                                 self.enter_position(symbol, side, quality, _reason)
                     except Exception as e:
                         logger.error(f"{symbol} cycle error: {e}")
