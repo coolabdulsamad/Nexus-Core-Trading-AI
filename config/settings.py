@@ -124,9 +124,16 @@ class GlobalConfig:
     # Evidence (Aug 27 - Sep 2 week): every loser came from the same cluster -
     # BUY in regime=trend_down with fearful sentiment on a thin (n=35) memory.
     # These gates make the brain prove the setup before money moves.
-    SENTIMENT_VETO_LONG = -0.60          # sent <= this -> no LONG (extreme fear)
-    SENTIMENT_VETO_SHORT = 0.60          # sent >= this -> no SHORT (extreme euphoria)
-    TOXIC_REGIME_SENT = -0.30            # regime=trend_down AND sent <= this -> veto LONG at ANY quality
+    # v3.6.6: recalibrated to the MEASURED live feed distribution (same lesson as
+    # the 0.60 quality dead-gate). NewsAPI keyword search returns mostly macro
+    # doom headlines that merely mention the ticker, so this feed lives at
+    # -0.75..-1.00 during any gloomy macro week. Measured Sep 8-11 2026: 40% of
+    # ALL stock readings were <= -0.60 -> the old veto was a permanent lockout
+    # (0 trades in 6 days; 1,739 high-q signals killed). New thresholds keep the
+    # true panic tail (~9% of readings) while letting normal bad-news weeks trade.
+    SENTIMENT_VETO_LONG = -0.90          # sent <= this -> no LONG (true panic tail only)
+    SENTIMENT_VETO_SHORT = 0.90          # sent >= this -> no SHORT (extreme euphoria)
+    TOXIC_REGIME_SENT = -0.75            # regime=trend_down AND sent <= this -> veto LONG at ANY quality
     # v3.6.3: was 0.60 - DEAD GATE. Measured over 39,570 live brain readings:
     # max q EVER observed is 0.480, so a 0.60 gate could never fire. 0.45 is
     # ~p95 of the observed range = genuinely "strong" but actually reachable.

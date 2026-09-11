@@ -250,7 +250,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.5"
+TRADER_VERSION = "v3.6.6"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -1057,9 +1057,10 @@ class MultiSymbolPaperTrader:
         # BUY + trend_down + fearful sentiment + thin memory)
         if signal in ('BUY', 'SELL'):
             side0 = 'LONG' if signal == 'BUY' else 'SHORT'
-            veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.60)
-            veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.60)
-            toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.30)
+            # v3.6.6: thresholds recalibrated to the measured feed distribution
+            veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.90)
+            veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.90)
+            toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.75)
             regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45)
             if side0 == 'LONG' and sent <= veto_long:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment ({sent:+.2f} <= {veto_long:+.2f})")
