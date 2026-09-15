@@ -124,6 +124,14 @@ class GlobalConfig:
     # Evidence (Aug 27 - Sep 2 week): every loser came from the same cluster -
     # BUY in regime=trend_down with fearful sentiment on a thin (n=35) memory.
     # These gates make the brain prove the setup before money moves.
+    # v3.6.7: memory depth is a FLOOR, not a scaler. Measured live Sep 2026:
+    # stocks sit at n=35, so eff_q = q x (n/80) made even the 0.35 floor
+    # unreachable (needed q >= 0.80; max q ever observed = 0.48) - a total
+    # entry lockout, 10 days 0 trades. The backtest always runs n=100
+    # (eff = raw q), so gating on RAW q also restores live<->backtest parity.
+    # Below MIN_MEMORY_NEIGHBORS there is no evidence base at all -> no trade.
+    MIN_MEMORY_NEIGHBORS = 20
+
     # v3.6.6: recalibrated to the MEASURED live feed distribution (same lesson as
     # the 0.60 quality dead-gate). NewsAPI keyword search returns mostly macro
     # doom headlines that merely mention the ticker, so this feed lives at
@@ -131,9 +139,14 @@ class GlobalConfig:
     # ALL stock readings were <= -0.60 -> the old veto was a permanent lockout
     # (0 trades in 6 days; 1,739 high-q signals killed). New thresholds keep the
     # true panic tail (~9% of readings) while letting normal bad-news weeks trade.
-    SENTIMENT_VETO_LONG = -0.90          # sent <= this -> no LONG (true panic tail only)
-    SENTIMENT_VETO_SHORT = 0.90          # sent >= this -> no SHORT (extreme euphoria)
-    TOXIC_REGIME_SENT = -0.75            # regime=trend_down AND sent <= this -> veto LONG at ANY quality
+    # v3.6.7: these are now STRENGTH ESCALATORS, not lockouts - the NewsAPI
+    # keyword feed saturates at exactly -1.00 during any gloomy macro week
+    # (measured: 9% of ALL stock readings pinned at <= -0.90 even after the
+    # v3.6.6 recalibration). Bad news no longer forbids entries; it demands
+    # QUALITY_STRONG. Sizing already scales down with quality.
+    SENTIMENT_VETO_LONG = -0.90          # sent <= this -> LONG needs QUALITY_STRONG
+    SENTIMENT_VETO_SHORT = 0.90          # sent >= this -> SHORT needs QUALITY_STRONG
+    TOXIC_REGIME_SENT = -0.75            # trend_down AND sent <= this -> LONG needs QUALITY_STRONG
     # v3.6.3: was 0.60 - DEAD GATE. Measured over 39,570 live brain readings:
     # max q EVER observed is 0.480, so a 0.60 gate could never fire. 0.45 is
     # ~p95 of the observed range = genuinely "strong" but actually reachable.

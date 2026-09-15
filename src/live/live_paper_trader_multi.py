@@ -250,7 +250,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.6"
+TRADER_VERSION = "v3.6.7"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -1047,34 +1047,46 @@ class MultiSymbolPaperTrader:
 
         regime, sent, n_mem = self._parse_reason(reason)
 
-        # v3.6: quality is only as good as the memory behind it. A q=0.46
-        # built on 35 neighbors is NOT better than a q=0.20 built on 100 -
-        # scale by depth before any gate looks at it.
-        ref_n = getattr(config, 'QUALITY_MEMORY_REF_N', 80)
-        eff_quality = quality * min(1.0, (n_mem / ref_n) if ref_n else 1.0) if n_mem else quality * 0.5
+        # v3.6.7: memory depth is a FLOOR, not a scaler. The old eff_q =
+        # q x (n/80) made entry mathematically impossible for stocks (n=35
+        # live -> the 0.35 floor needed q >= 0.80; max q ever = 0.48).
+        # Gates now run on RAW q (identical to the backtest, which runs
+        # n=100 so eff = q there). n below MIN_MEMORY_NEIGHBORS = no
+        # evidence base at all -> no trade.
+        min_n = getattr(config, 'MIN_MEMORY_NEIGHBORS', 20)
+        eff_quality = quality
+        if signal in ('BUY', 'SELL') and (n_mem or 0) < min_n:
+            logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: memory too thin "
+                        f"(n={n_mem or 0} < {min_n} - no evidence base)")
+            return None, 0.0, reason
 
         # v3.6 entry analysis gates (the losing cluster was always the same:
         # BUY + trend_down + fearful sentiment + thin memory)
         if signal in ('BUY', 'SELL'):
             side0 = 'LONG' if signal == 'BUY' else 'SHORT'
             # v3.6.6: thresholds recalibrated to the measured feed distribution
+            # v3.6.7: vetoes are strength escalators, not lockouts (feed
+            # saturates at exactly -1.00 in any gloomy macro week)
             veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.90)
             veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.90)
             toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.75)
             regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45)
-            if side0 == 'LONG' and sent <= veto_long:
-                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment ({sent:+.2f} <= {veto_long:+.2f})")
+            strong_q = getattr(config, 'QUALITY_STRONG', 0.45)
+            if side0 == 'LONG' and sent <= veto_long and quality < strong_q:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment "
+                            f"({sent:+.2f} <= {veto_long:+.2f}) - needs STRONG (>= {strong_q:.2f})")
                 return None, eff_quality, reason
-            if side0 == 'SHORT' and sent >= veto_short:
-                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment ({sent:+.2f} >= {veto_short:+.2f})")
+            if side0 == 'SHORT' and sent >= veto_short and quality < strong_q:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment "
+                            f"({sent:+.2f} >= {veto_short:+.2f}) - needs STRONG (>= {strong_q:.2f})")
                 return None, eff_quality, reason
-            if side0 == 'LONG' and regime == 'trend_down' and sent <= toxic_sent:
+            if side0 == 'LONG' and regime == 'trend_down' and sent <= toxic_sent and quality < strong_q:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: toxic combo "
-                            f"(regime=trend_down AND sent {sent:+.2f} <= {toxic_sent:+.2f})")
+                            f"(regime=trend_down AND sent {sent:+.2f} <= {toxic_sent:+.2f}) - needs STRONG (>= {strong_q:.2f})")
                 return None, eff_quality, reason
-            if side0 == 'SHORT' and regime == 'trend_up' and sent >= -toxic_sent:
+            if side0 == 'SHORT' and regime == 'trend_up' and sent >= -toxic_sent and quality < strong_q:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: toxic combo "
-                            f"(regime=trend_up AND sent {sent:+.2f} >= {-toxic_sent:+.2f})")
+                            f"(regime=trend_up AND sent {sent:+.2f} >= {-toxic_sent:+.2f}) - needs STRONG (>= {strong_q:.2f})")
                 return None, eff_quality, reason
             if ((side0 == 'LONG' and regime == 'trend_down') or
                     (side0 == 'SHORT' and regime == 'trend_up')) and eff_quality < regime_min_q:

@@ -124,7 +124,7 @@ class BacktesterEngine:
                            blocked_crypto_momentum=0, blocked_loss_cooldown=0,
                            blocked_confirmation=0,
                            conf_bar_confirm=0, conf_vwap_confirm=0,
-                           conf_no_chase=0, conf_adx=0)
+                           conf_no_chase=0, conf_adx=0, blocked_memory_floor=0)
 
     def fetch_data(self) -> pd.DataFrame:
         suffix = config.BAR_SUFFIX
@@ -417,14 +417,21 @@ class BacktesterEngine:
                         sent = r_sent
                     else:
                         sent = 0.0
-                    ref_n = getattr(config, 'QUALITY_MEMORY_REF_N', 80)
-                    eff_quality = quality * min(1.0, (n_mem / ref_n) if ref_n else 1.0) \
-                        if n_mem else quality * 0.5
+                    # v3.6.7: memory depth is a FLOOR, not a scaler (mirrors
+                    # live). Gates run on raw q; n below MIN_MEMORY_NEIGHBORS
+                    # means no evidence base at all. Backtest memory runs
+                    # n=100, so this never binds here - live parity preserved.
+                    min_n = getattr(config, 'MIN_MEMORY_NEIGHBORS', 20)
+                    eff_quality = quality
+                    if (n_mem or 0) < min_n:
+                        self.funnel['blocked_memory_floor'] += 1
+                        proceed = False
 
-                    veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.60)
-                    veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.60)
-                    toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.30)
+                    veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.90)
+                    veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.90)
+                    toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.75)
                     regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45)
+                    strong_q = getattr(config, 'QUALITY_STRONG', 0.45)
 
                     if self._session_open_blackout(t):
                         self.funnel['blocked_session_open'] += 1
@@ -432,16 +439,16 @@ class BacktesterEngine:
                     elif self._loss_cooldown_active(t):
                         self.funnel['blocked_loss_cooldown'] += 1
                         proceed = False
-                    elif side0 == 'LONG' and sent <= veto_long:
+                    elif side0 == 'LONG' and sent <= veto_long and quality < strong_q:
                         self.funnel['blocked_sentiment'] += 1
                         proceed = False
-                    elif side0 == 'SHORT' and sent >= veto_short:
+                    elif side0 == 'SHORT' and sent >= veto_short and quality < strong_q:
                         self.funnel['blocked_sentiment'] += 1
                         proceed = False
-                    elif side0 == 'LONG' and regime == 'trend_down' and sent <= toxic_sent:
+                    elif side0 == 'LONG' and regime == 'trend_down' and sent <= toxic_sent and quality < strong_q:
                         self.funnel['blocked_toxic_combo'] += 1
                         proceed = False
-                    elif side0 == 'SHORT' and regime == 'trend_up' and sent >= -toxic_sent:
+                    elif side0 == 'SHORT' and regime == 'trend_up' and sent >= -toxic_sent and quality < strong_q:
                         self.funnel['blocked_toxic_combo'] += 1
                         proceed = False
                     elif ((side0 == 'LONG' and regime == 'trend_down') or
