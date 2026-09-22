@@ -225,10 +225,18 @@ class GlobalConfig:
     RETRACEMENT_KEEP_PCT = 0.60          # exit if profit falls to 60% of peak (was fixed 0.50 ATR)
     PROFIT_RATCHET_ATR = 1.5             # at +1.5 ATR the stop ratchets up ...
     RATCHET_LOCK_ATR = 0.50              # ... to entry + 0.5 ATR (locks real money, not breakeven)
+    # v3.6.8: early harvest rung, measured on live MFE (Sep 2026): stock entries
+    # typically peak +0.3..+0.8 ATR intraday - CVX peaked +0.80, XOM +0.31, both
+    # BELOW every profit mechanism (first rung was +1.0) and decayed to full
+    # -2 ATR stop-outs (-$588 combined). Once +0.75 ATR, the stop moves to
+    # entry + 0.10 ATR: "started in profit" can no longer become "full loss".
+    BREAKEVEN_LOCK_ENABLED = True
+    BREAKEVEN_LOCK_ARM_ATR = 0.75        # arm the early lock at +0.75 ATR
+    BREAKEVEN_LOCK_PLUS_ATR = 0.10       # stop -> entry + 0.10 ATR (small real lock)
     TRAILING_STOP_ACTIVATE_ATR = 2.5     # hard trailing starts at +2.5 ATR (was 4.0 - never fired)
     TRAILING_STOP_DISTANCE_ATR = 2.5     # trail 2.5 ATR behind the peak (was 6.0 - never mattered)
-    SCALE_OUT_ENABLED = True             # sell 1/3 at +1 ATR and 1/3 at +2 ATR, trail the rest
-    SCALE_OUT_1_ATR = 1.0
+    SCALE_OUT_ENABLED = True             # sell 1/3 at +0.75 ATR and 1/3 at +2 ATR, trail the rest
+    SCALE_OUT_1_ATR = 0.75               # v3.6.8: was 1.0 - first banking rung within reach of measured stock MFE (~+0.8 ATR)
     SCALE_OUT_2_ATR = 2.0
     SCALE_OUT_PCT = 0.33
     # In-trade re-analysis: the brain re-judges every open position each cycle

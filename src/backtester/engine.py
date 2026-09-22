@@ -297,6 +297,15 @@ class BacktesterEngine:
         peak = max(pos.get('_v36_peak', 0.0), atr_profit)
         pos['_v36_peak'] = peak
 
+        # 1.5) Early breakeven-plus lock (v3.6.8, mirrors live): once
+        #    +BREAKEVEN_LOCK_ARM_ATR, stop moves to entry +/- a small lock.
+        if getattr(config, 'BREAKEVEN_LOCK_ENABLED', True) and not pos.get('_v368_elock') \
+                and atr_profit >= getattr(config, 'BREAKEVEN_LOCK_ARM_ATR', 0.75):
+            lock = (entry + config.BREAKEVEN_LOCK_PLUS_ATR * atr) if side == 'LONG' \
+                else (entry - config.BREAKEVEN_LOCK_PLUS_ATR * atr)
+            _pos_set_sl(pos, lock, side)
+            pos['_v368_elock'] = True
+
         # 2) Profit ratchet (replaces the breakeven lock): at +PROFIT_RATCHET_ATR
         #    the stop jumps to entry +/- RATCHET_LOCK_ATR. Real money locked.
         if not pos.get('_v36_ratchet') and atr_profit >= config.PROFIT_RATCHET_ATR:

@@ -210,6 +210,9 @@ RETRACEMENT_ARM_ATR = config.RETRACEMENT_ARM_ATR        # v3.6: arm at +2 ATR pe
 RETRACEMENT_KEEP_PCT = config.RETRACEMENT_KEEP_PCT      # v3.6: keep 60% of peak (was fixed 0.50 ATR)
 PROFIT_RATCHET_ATR = config.PROFIT_RATCHET_ATR
 RATCHET_LOCK_ATR = config.RATCHET_LOCK_ATR
+BREAKEVEN_LOCK_ENABLED = getattr(config, 'BREAKEVEN_LOCK_ENABLED', True)
+BREAKEVEN_LOCK_ARM_ATR = getattr(config, 'BREAKEVEN_LOCK_ARM_ATR', 0.75)
+BREAKEVEN_LOCK_PLUS_ATR = getattr(config, 'BREAKEVEN_LOCK_PLUS_ATR', 0.10)
 
 DAILY_PROFIT_TARGET_ENABLED = config.DAILY_PROFIT_TARGET_PCT > 0
 DAILY_TARGET_PCT = config.DAILY_PROFIT_TARGET_PCT
@@ -250,7 +253,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.7"
+TRADER_VERSION = "v3.6.8"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -1297,6 +1300,23 @@ class MultiSymbolPaperTrader:
         else:
             atr_profit = (entry - price) / atr
             peak_profit = (entry - self.lowest_price[symbol]) / atr
+
+        # 1.5) Early breakeven-plus lock (v3.6.8): measured on live MFE - stock
+        #    entries typically peak +0.3..+0.8 ATR (CVX +0.80, XOM +0.31) and
+        #    never reached ANY profit rung before decaying to full stop-outs.
+        #    Once armed, "started in profit" can no longer become "full loss".
+        if BREAKEVEN_LOCK_ENABLED and not self.breakeven_set[symbol] \
+                and atr_profit >= BREAKEVEN_LOCK_ARM_ATR:
+            lock = (entry + BREAKEVEN_LOCK_PLUS_ATR * atr) if side == 'LONG' \
+                else (entry - BREAKEVEN_LOCK_PLUS_ATR * atr)
+            if side == 'LONG':
+                self.stop_loss[symbol] = max(self.stop_loss[symbol], lock)
+            else:
+                self.stop_loss[symbol] = min(self.stop_loss[symbol], lock)
+            self.breakeven_set[symbol] = True
+            send_telegram(f"🔐 {symbol} +{atr_profit:.1f} ATR - early lock armed: stop moved to "
+                          f"${self.stop_loss[symbol]:.2f} (entry +{BREAKEVEN_LOCK_PLUS_ATR:.2f} ATR). "
+                          f"This trade cannot lose anymore.", 'info')
 
         # 2) Profit ratchet (v3.6 - replaces the breakeven lock, which fired
         #    ZERO times all week): at +PROFIT_RATCHET_ATR the stop jumps to
