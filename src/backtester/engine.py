@@ -297,6 +297,19 @@ class BacktesterEngine:
         peak = max(pos.get('_v36_peak', 0.0), atr_profit)
         pos['_v36_peak'] = peak
 
+        # 0) EOD flatten (v3.6.9, stocks only, mirrors live): on the last bar
+        #    of the trading day, a position that can still lose gets closed.
+        #    Timezone-agnostic: "last bar" = next bar is a different date.
+        if getattr(config, 'EOD_FLATTEN_ENABLED', True) and '/' not in self.symbol:
+            nxt = self.df.iloc[idx + 1]['timestamp'] if idx + 1 < len(self.df) else None
+            last_bar_today = nxt is None or pd.Timestamp(nxt).date() != pd.Timestamp(t).date()
+            if last_bar_today:
+                sl0 = _pos_sl(pos)
+                can_lose = (side == 'LONG' and (sl0 is None or sl0 < entry)) or \
+                           (side == 'SHORT' and (sl0 is None or sl0 > entry))
+                if can_lose:
+                    return 'eod_flatten'
+
         # 1.5) Early breakeven-plus lock (v3.6.8, mirrors live): once
         #    +BREAKEVEN_LOCK_ARM_ATR, stop moves to entry +/- a small lock.
         if getattr(config, 'BREAKEVEN_LOCK_ENABLED', True) and not pos.get('_v368_elock') \

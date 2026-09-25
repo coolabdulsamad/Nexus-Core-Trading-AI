@@ -233,6 +233,14 @@ class GlobalConfig:
     BREAKEVEN_LOCK_ENABLED = True
     BREAKEVEN_LOCK_ARM_ATR = 0.75        # arm the early lock at +0.75 ATR
     BREAKEVEN_LOCK_PLUS_ATR = 0.10       # stop -> entry + 0.10 ATR (small real lock)
+    # v3.6.9: overnight gap protection (stocks only). Measured live Sep 2026:
+    # CVX/XOM/NVDA all entered fine, faded slowly, then died OVERNIGHT while no
+    # exit could execute (-$588 and -$433). Crypto (24/7) has no such trap -
+    # every crypto trade closed +$46/-$1. Rule: in the last EOD_FLATTEN_MINUTES
+    # of the session, a stock position that can still lose is closed at market.
+    # Early-locked trades (stop >= entry, "cannot lose") are free to hold.
+    EOD_FLATTEN_ENABLED = True
+    EOD_FLATTEN_MINUTES = 30
     TRAILING_STOP_ACTIVATE_ATR = 2.5     # hard trailing starts at +2.5 ATR (was 4.0 - never fired)
     TRAILING_STOP_DISTANCE_ATR = 2.5     # trail 2.5 ATR behind the peak (was 6.0 - never mattered)
     SCALE_OUT_ENABLED = True             # sell 1/3 at +0.75 ATR and 1/3 at +2 ATR, trail the rest

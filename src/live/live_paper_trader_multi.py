@@ -253,7 +253,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.8"
+TRADER_VERSION = "v3.6.9"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -1301,6 +1301,27 @@ class MultiSymbolPaperTrader:
             atr_profit = (entry - price) / atr
             peak_profit = (entry - self.lowest_price[symbol]) / atr
 
+        # 0) EOD flatten (v3.6.9, stocks only): in the last EOD_FLATTEN_MINUTES
+        #    of the session, a position that can still lose is closed at market.
+        #    Overnight gaps killed CVX/XOM/NVDA (-$588, -$433) while no exit
+        #    could execute; crypto (24/7) is exempt. Early-locked trades
+        #    (stop >= entry, "cannot lose") are free to hold overnight.
+        if EOD_FLATTEN_ENABLED and not self._is_crypto(symbol):
+            clock = getattr(self, '_cycle_clock', None)
+            if clock is not None and getattr(clock, 'is_open', False):
+                try:
+                    mins_left = (clock.next_close - datetime.now(timezone.utc)).total_seconds() / 60
+                except Exception:
+                    mins_left = None
+                if mins_left is not None and 0 < mins_left <= EOD_FLATTEN_MINUTES:
+                    stop = self.stop_loss[symbol]
+                    can_lose = (side == 'LONG' and (stop is None or stop < entry)) or \
+                               (side == 'SHORT' and (stop is None or stop > entry))
+                    if can_lose:
+                        logger.info(f"{symbol} EOD_FLATTEN: {mins_left:.0f} min to close, "
+                                    f"position can still lose - closing before the bell")
+                        return 'EOD_FLATTEN'
+
         # 1.5) Early breakeven-plus lock (v3.6.8): measured on live MFE - stock
         #    entries typically peak +0.3..+0.8 ATR (CVX +0.80, XOM +0.31) and
         #    never reached ANY profit rung before decaying to full stop-outs.
@@ -1653,6 +1674,11 @@ class MultiSymbolPaperTrader:
                 equity = float(account.equity)
                 self._last_equity = equity
                 market_open = self._market_open()
+                # v3.6.9: cache the clock once per cycle for the EOD-flatten check
+                try:
+                    self._cycle_clock = self.trading_client.get_clock()
+                except Exception:
+                    self._cycle_clock = None
 
                 for symbol in self.all_symbols:
                     try:
