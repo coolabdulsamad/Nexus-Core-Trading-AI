@@ -213,6 +213,10 @@ RATCHET_LOCK_ATR = config.RATCHET_LOCK_ATR
 BREAKEVEN_LOCK_ENABLED = getattr(config, 'BREAKEVEN_LOCK_ENABLED', True)
 BREAKEVEN_LOCK_ARM_ATR = getattr(config, 'BREAKEVEN_LOCK_ARM_ATR', 0.75)
 BREAKEVEN_LOCK_PLUS_ATR = getattr(config, 'BREAKEVEN_LOCK_PLUS_ATR', 0.10)
+# v3.6.9a hotfix: these module constants were missing -> NameError skipped
+# most of manage_exit for every open position each cycle
+EOD_FLATTEN_ENABLED = getattr(config, 'EOD_FLATTEN_ENABLED', True)
+EOD_FLATTEN_MINUTES = getattr(config, 'EOD_FLATTEN_MINUTES', 30)
 
 DAILY_PROFIT_TARGET_ENABLED = config.DAILY_PROFIT_TARGET_PCT > 0
 DAILY_TARGET_PCT = config.DAILY_PROFIT_TARGET_PCT
@@ -253,7 +257,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.9"
+TRADER_VERSION = "v3.6.9a"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
