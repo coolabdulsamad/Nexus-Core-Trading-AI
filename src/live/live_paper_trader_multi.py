@@ -257,7 +257,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.9a"
+TRADER_VERSION = "v3.6.9b"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -1667,6 +1667,32 @@ class MultiSymbolPaperTrader:
             f"1H Trader started ({TRADER_VERSION})\nStocks: {', '.join(self.symbols) or 'none'}\n"
             f"Crypto: {', '.join(self.crypto_symbols) or 'none'}", 'info')
 
+        # v3.6.9b: startup EOD sweep. If we (re)start INSIDE the flatten
+        # window, check open positions immediately - the first normal cycle
+        # walks 30+ flat symbols first (~10s each), so a position near the
+        # end of the alphabet can miss the bell (LLY/META escaped the
+        # 2026-09-25 flatten by ~2 min after a 20:55 restart).
+        if EOD_FLATTEN_ENABLED:
+            try:
+                clock = self.trading_client.get_clock()
+                if getattr(clock, 'is_open', False):
+                    mins_left = (clock.next_close - datetime.now(timezone.utc)).total_seconds() / 60
+                    if 0 < mins_left <= EOD_FLATTEN_MINUTES:
+                        logger.info(f"Startup EOD sweep: {mins_left:.0f} min to close - checking open positions first")
+                        self._cycle_clock = clock
+                        for sym in self.all_symbols:
+                            if self.in_position.get(sym) and not self._is_crypto(sym):
+                                try:
+                                    reason = self.manage_exit(sym)
+                                    if reason:
+                                        qty = abs(self.get_position_qty(sym))
+                                        if qty > 0:
+                                            self.close_position(sym, qty, reason)
+                                except Exception as e:
+                                    logger.error(f"{sym} startup sweep error: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"startup EOD sweep failed: {e}", exc_info=True)
+
         while True:
             try:
                 self.cycle_count += 1
@@ -1708,7 +1734,7 @@ class MultiSymbolPaperTrader:
                             if side and quality >= self._min_quality(symbol):
                                 self.enter_position(symbol, side, quality, _reason)
                     except Exception as e:
-                        logger.error(f"{symbol} cycle error: {e}")
+                        logger.error(f"{symbol} cycle error: {e}", exc_info=True)
 
                 # Heartbeat + EOD
                 if self.cycle_count % HEARTBEAT_CYCLES == 0:
