@@ -1,5 +1,5 @@
 """
-src/models/meta_learner.py  (Brain v2.2.1)
+src/models/meta_learner.py  (Brain v2.3.0)
 ======================================
 Case-based reasoning over Qdrant memory. For the current market state it
 retrieves the k most similar HISTORICAL states and averages their realised
@@ -14,6 +14,27 @@ v2.2.1
   fallback trades (798 trades, -61% in one backtest). A blind system must
   stand down, not gamble. Set ALLOW_TREND_FALLBACK_TRADES=True in config
   only if you explicitly want the old behaviour.
+
+v2.3.0 (quality-formula fix, measured on 52,373 live readings Sep 15-Oct 13)
+----------------------------------------------------------------------------
+- THE SATURATION BUG: conviction was min(1, |prob-0.5| / 0.10) - full marks
+  whenever prob moved just 10% off 0.5, i.e. |wmean| >= 0.004. Real weighted
+  4h returns live at |wmean| ~ 0.007 (p90), so ~20% of ALL readings pinned
+  conviction at 1.0 and q collapsed onto a flat 0.43-0.47 plateau
+  (= 1.0 x |agree| x sim). Quality was effectively BINARY: the saturated
+  cluster rubber-stamped every gate while genuinely good setups
+  (q 0.10-0.30) were blocked. corr(q, |wmean|) was only 0.30.
+- THE FIX: conviction = min(1, |prob-0.5| * 2) - a linear gradient that
+  only reaches full marks at prob -> 0/1. On the same 52,373 readings:
+  saturation 19.7% -> 0.0%, corr(q, |wmean|) 0.30 -> 0.77. Quality now
+  actually ranks setups.
+- Gates recalibrated in settings.py to the fixed distribution (quality is
+  now computed from the PRE-NUDGE prob, so the saturating news feed can't
+  inflate it): stock MIN = 0.07 (~p57 of stock signals), MEDIUM = 0.10,
+  STRONG = 0.156 (the strong-evidence plateau, top ~23%), CRYPTO_MIN =
+  0.029 (p85 of the smooth crypto gradient), TREND_REGIME_MIN = STRONG.
+  Advisory fallback quality lowered 0.10 -> 0.005 so a blind brain still
+  stands down under the new floor.
 """
 import numpy as np
 import pandas as pd
@@ -43,7 +64,12 @@ class MetaLearner:
         return 1 / (1 + np.exp(-x))
 
     def _quality_score(self, prob, agreement, sim_avg):
-        conviction = min(1.0, abs(prob - 0.5) / 0.10)   # full marks at +/-10%
+        # v2.3.0: linear conviction gradient. The old /0.10 scale gave full
+        # marks at prob=0.60 (|wmean| >= 0.004) - 19.7% of live readings
+        # saturated, and q became a binary stamp instead of a ranking.
+        # *2 reaches full marks only at prob -> 0/1, so conviction tracks
+        # the actual prediction magnitude across the whole observed range.
+        conviction = min(1.0, abs(prob - 0.5) * 2)
         return round(float(conviction * abs(agreement) * max(0.0, min(1.0, sim_avg))), 4)
 
     # ------------------------------------------------------------------
@@ -114,11 +140,22 @@ class MetaLearner:
 
         prob = float(self._sigmoid(wmean * 100))
 
+        # v2.3.0: quality is computed from the PRE-NUDGE prob. Quality must
+        # measure the strength of the MEMORY EVIDENCE (wmean/agree/sim) only.
+        # The NewsAPI keyword feed saturates at -1.00 in gloomy macro weeks;
+        # letting the sentiment nudge inflate conviction would rubber-stamp
+        # weak memory signals exactly when the feed is most extreme. The
+        # nudge still influences DIRECTION below - it just can't buy quality.
+        # (Backtests never nudge, so this also restores live<->backtest
+        # quality parity.)
+        quality = self._quality_score(prob, agreement, sim_avg)
+
         # Live sentiment nudge (bounded, off in backtests by default)
         if mode == 'live':
             prob = float(np.clip(prob + sentiment * config.SENTIMENT_BIAS, 0.0, 1.0))
 
         # ---- 6. Decision with HOLD zone + agreement gates ----
+        # (quality was already computed above, from the pre-nudge prob)
         direction = 'HOLD'
         if prob > BUY_THRESHOLD:
             direction = 'BUY'
@@ -136,8 +173,6 @@ class MetaLearner:
             direction = 'HOLD'
         elif direction == 'SELL' and agreement >= 0:
             direction = 'HOLD'
-
-        quality = self._quality_score(prob, agreement, sim_avg)
 
         reason = (f"wmean={wmean:+.5f} agree={agreement:+.2f} sim={sim_avg:.2f} "
                   f"n={len(usable)} sent={sentiment:+.2f} regime={row_copy.get('regime_label', 'n/a')}")
@@ -171,7 +206,12 @@ class MetaLearner:
         except Exception:
             pass
         signal = 'BUY' if prob > BUY_THRESHOLD else ('SELL' if prob < SELL_THRESHOLD else 'HOLD')
-        quality = 0.25 if ALLOW_FALLBACK_TRADES else 0.10
+        # v2.3.0: advisory quality 0.10 -> 0.005. Gates were recalibrated to
+        # the fixed quality scale (MIN_SIGNAL_QUALITY = 0.07), so 0.10 would
+        # now PASS the entry floor and re-enable blind fallback trading.
+        # 0.005 stays below any sane gate; opting in via ALLOW_TREND_FALLBACK_
+        # TRADES sets 0.16 (just above the STRONG tier, 0.156).
+        quality = 0.16 if ALLOW_FALLBACK_TRADES else 0.005
         return {'symbol': symbol, 'signal': signal, 'confidence': prob,
                 'quality': quality, 'agreement': 0.0, 'neighbors_used': 0,
                 'reason': f'trend_fallback ({reason})'}
