@@ -122,9 +122,8 @@ move alerts, retracement-arm alert, per-cycle REANALYSIS log lines.
 
 v3.6.3 (data-calibrated gates + entry confirmation):
 - Measured over 39,570 live brain readings: max q EVER observed = 0.480, so
-  the 0.60 STRONG gates could never fire. Recalibrated: counter-regime STRONG
-  and the STRONG sizing tier now 0.45 (~p95 of observed). Crypto gets its own
-  quality floor (0.25) - its q distribution is structurally lower.
+  the 0.60 STRONG gates could never fire. Recalibrated gates to the observed
+  range. (Superseded by v3.7.0 - see below.)
 - ENTRY CONFIRMATION LAYER: the brain votes from memory, then the current
   tape must agree before money moves: last closed bar with the signal, price
   on the right side of VWAP, no chasing spike bars (>1.5x ATR), with-trend
@@ -217,6 +216,16 @@ BREAKEVEN_LOCK_PLUS_ATR = getattr(config, 'BREAKEVEN_LOCK_PLUS_ATR', 0.10)
 # most of manage_exit for every open position each cycle
 EOD_FLATTEN_ENABLED = getattr(config, 'EOD_FLATTEN_ENABLED', True)
 EOD_FLATTEN_MINUTES = getattr(config, 'EOD_FLATTEN_MINUTES', 30)
+# v3.7.0
+EOD_FLATTEN_ALL_STOCKS = getattr(config, 'EOD_FLATTEN_ALL_STOCKS', True)
+STOCK_ENTRY_CUTOFF_MINUTES = getattr(config, 'STOCK_ENTRY_CUTOFF_MINUTES', 60)
+DAILY_PROFIT_TARGET_USD = getattr(config, 'DAILY_PROFIT_TARGET_USD', 200.0)
+DAILY_LOSS_LIMIT_USD = getattr(config, 'DAILY_LOSS_LIMIT_USD', 300.0)
+SIZE_BY_QUALITY_ENABLED = getattr(config, 'SIZE_BY_QUALITY_ENABLED', True)
+SIZE_BY_QUALITY_MAX_MULT = getattr(config, 'SIZE_BY_QUALITY_MAX_MULT', 1.5)
+EXHAUSTION_FILTER_ENABLED = getattr(config, 'EXHAUSTION_FILTER_ENABLED', True)
+EXHAUSTION_RSI_LONG = getattr(config, 'EXHAUSTION_RSI_LONG', 70.0)
+EXHAUSTION_RSI_SHORT = getattr(config, 'EXHAUSTION_RSI_SHORT', 30.0)
 
 DAILY_PROFIT_TARGET_ENABLED = config.DAILY_PROFIT_TARGET_PCT > 0
 DAILY_TARGET_PCT = config.DAILY_PROFIT_TARGET_PCT
@@ -250,14 +259,14 @@ ENTRY_VWAP_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_VWAP_CONFIRM_TOLERANCE_ATR',
 ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
 ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
 ENTRY_ADX_MIN = getattr(config, 'ENTRY_ADX_MIN', 20.0)
-CRYPTO_MIN_SIGNAL_QUALITY = getattr(config, 'CRYPTO_MIN_SIGNAL_QUALITY', 0.25)
+CRYPTO_MIN_SIGNAL_QUALITY = getattr(config, 'CRYPTO_MIN_SIGNAL_QUALITY', 0.029)
 VOL_FILTER_ENABLED = getattr(config, 'VOLATILITY_FILTER_ENABLED', True)
 VOL_RATIO_MAX = getattr(config, 'VOLATILITY_RATIO_MAX', 3.0)
 COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.6.9b"
+TRADER_VERSION = "v3.7.0"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -334,6 +343,9 @@ class MultiSymbolPaperTrader:
         self.daily_trades = {s: [] for s in self.all_symbols}
         self.daily_start_equity = {s: None for s in self.all_symbols}
         self.daily_realized_pnl = {s: 0.0 for s in self.all_symbols}
+        self._last_reset_day = {}
+        self._daily_loss_halted = False
+        self._daily_target_halted = False
         self.daily_target_hit = {s: False for s in self.all_symbols}
         self.time_partial_done = {s: False for s in self.all_symbols}
         self.scale_out_1_done = {s: False for s in self.all_symbols}
@@ -828,6 +840,10 @@ class MultiSymbolPaperTrader:
         qty = abs(signed_qty)
         if qty <= 0 or avg_entry <= 0:
             return
+        # v3.7.0 fix: adopted positions must get the FULL state init, not a
+        # subset - the old path left retracement_armed (and friends) missing,
+        # and the position heartbeat crashed on them (KeyError: 'SOL/USD').
+        self._init_symbol_state(symbol)
         self.in_position[symbol] = True
         self.position_side[symbol] = side
         self.position_qty[symbol] = qty
@@ -884,6 +900,15 @@ class MultiSymbolPaperTrader:
             except Exception as e:
                 logger.warning(f"{symbol} equity fetch failed ({e}) - using default slice")
         risk_amount = capital * risk_pct
+        # v3.7.0 (user mandate): scale risk by signal strength - 1.0x at the
+        # entry floor up to SIZE_BY_QUALITY_MAX_MULT at QUALITY_STRONG. Hard
+        # notional / buying-power caps below still apply, so this can never
+        # exceed the account guardrails.
+        if SIZE_BY_QUALITY_ENABLED and config.QUALITY_STRONG > config.MIN_SIGNAL_QUALITY:
+            frac = min(1.0, max(0.0, (quality - config.MIN_SIGNAL_QUALITY)
+                                / (config.QUALITY_STRONG - config.MIN_SIGNAL_QUALITY)))
+            mult = 1.0 + (SIZE_BY_QUALITY_MAX_MULT - 1.0) * frac
+            risk_amount *= mult
         stop_distance = STOP_ATR_MULT * atr
         if stop_distance <= 0 or price <= 0:
             return 0.0
@@ -1025,6 +1050,18 @@ class MultiSymbolPaperTrader:
             if abs(ret_1) > ENTRY_NO_CHASE_MAX_RANGE_ATR * atr_pct:
                 return False, f"no-chase: last bar moved {abs(ret_1)/atr_pct:.1f}x ATR - entry would be chasing"
 
+        # v3.7.0: exhaustion filter - never buy a momentum top or sell a
+        # momentum bottom (overbought RSI + MACD already rolling over = the
+        # move is DONE). Defensive: missing indicator data never blocks.
+        if EXHAUSTION_FILTER_ENABLED:
+            rsi = latest.get('rsi_14')
+            macd_h = latest.get('macd_hist')
+            if rsi is not None and not np.isnan(rsi) and macd_h is not None and not np.isnan(macd_h):
+                if side0 == 'LONG' and rsi >= EXHAUSTION_RSI_LONG and macd_h < 0:
+                    return False, f"exhaustion: RSI {rsi:.0f} overbought + MACD rolling over - that is a top, not an entry"
+                if side0 == 'SHORT' and rsi <= EXHAUSTION_RSI_SHORT and macd_h > 0:
+                    return False, f"exhaustion: RSI {rsi:.0f} oversold + MACD turning up - that is a bottom, not an entry"
+
         if ENTRY_ADX_MIN > 0 and adx is not None and not np.isnan(adx):
             with_trend = ((side0 == 'LONG' and price > sma) or (side0 == 'SHORT' and price < sma))
             if with_trend and adx < ENTRY_ADX_MIN:
@@ -1035,6 +1072,18 @@ class MultiSymbolPaperTrader:
     def check_entry(self, symbol: str) -> Tuple[Optional[str], float, str]:
         if self._session_open_blackout(symbol):
             return None, 0.0, 'session_open_blackout'
+        # v3.7.0: stocks are intraday-only, so a new stock entry this close to
+        # the bell is a trade built to be flattened - skip it entirely.
+        if not self._is_crypto(symbol):
+            clock = getattr(self, '_cycle_clock', None)
+            if clock is not None and getattr(clock, 'is_open', False):
+                try:
+                    mins_left = (clock.next_close - datetime.now(timezone.utc)).total_seconds() / 60
+                except Exception:
+                    mins_left = None
+                if mins_left is not None and 0 < mins_left <= STOCK_ENTRY_CUTOFF_MINUTES:
+                    return None, 0.0, f'session ends in {mins_left:.0f}m - too late for a new stock trade'
+
         df = self.get_bars(symbol)
         if df is None or len(df) < SMA_PERIOD + 5:
             return None, 0.0, 'no_data'
@@ -1077,8 +1126,8 @@ class MultiSymbolPaperTrader:
             veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.90)
             veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.90)
             toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.75)
-            regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45)
-            strong_q = getattr(config, 'QUALITY_STRONG', 0.45)
+            regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.156)
+            strong_q = getattr(config, 'QUALITY_STRONG', 0.156)
             if side0 == 'LONG' and sent <= veto_long and quality < strong_q:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: extreme sentiment "
                             f"({sent:+.2f} <= {veto_long:+.2f}) - needs STRONG (>= {strong_q:.2f})")
@@ -1321,9 +1370,11 @@ class MultiSymbolPaperTrader:
                     stop = self.stop_loss[symbol]
                     can_lose = (side == 'LONG' and (stop is None or stop < entry)) or \
                                (side == 'SHORT' and (stop is None or stop > entry))
-                    if can_lose:
-                        logger.info(f"{symbol} EOD_FLATTEN: {mins_left:.0f} min to close, "
-                                    f"position can still lose - closing before the bell")
+                    # v3.7.0 (user mandate): stocks are intraday-only - flatten
+                    # EVERYTHING at the bell, winners included.
+                    if EOD_FLATTEN_ALL_STOCKS or can_lose:
+                        logger.info(f"{symbol} EOD_FLATTEN: {mins_left:.0f} min to close - "
+                                    f"closing before the bell (intraday-only stocks)")
                         return 'EOD_FLATTEN'
 
         # 1.5) Early breakeven-plus lock (v3.6.8): measured on live MFE - stock
@@ -1534,17 +1585,40 @@ class MultiSymbolPaperTrader:
     # ================= Daily guards =================
     def _check_daily_reset(self, symbol: str, equity: float):
         today = datetime.now(timezone.utc).date()
+        # v3.7.0 fix: the old code used ONE global _last_reset flag - only the
+        # first symbol processed each day got its daily state reset; every
+        # other symbol accumulated realized P&L across days forever, which
+        # silently corrupted every daily guardrail. Now per-symbol.
         if self.daily_start_equity[symbol] is None:
             self.daily_start_equity[symbol] = equity
-            self._last_reset = today
-        elif getattr(self, '_last_reset', None) != today:
+            self._last_reset_day[symbol] = today
+        elif self._last_reset_day.get(symbol) != today:
             self.daily_start_equity[symbol] = equity
             self.daily_realized_pnl[symbol] = 0.0
             self.daily_target_hit[symbol] = False
             self.daily_trades[symbol] = []
-            self._last_reset = today
+            self._last_reset_day[symbol] = today
+            # account-wide USD rails reset with the new day
+            self._daily_loss_halted = False
+            self._daily_target_halted = False
 
     def _daily_guard(self, symbol: str, equity: float) -> Tuple[bool, str]:
+        # v3.7.0 (user mandate): account-wide USD circuit breakers, checked
+        # FIRST. Hit +$200 realized -> bank the day; hit -$300 realized ->
+        # stop the bleeding. Open positions keep their normal exit rules.
+        realized = sum(self.daily_realized_pnl.values())
+        if DAILY_LOSS_LIMIT_USD > 0 and realized <= -DAILY_LOSS_LIMIT_USD:
+            if not self._daily_loss_halted:
+                self._daily_loss_halted = True
+                send_telegram(f"🛑 DAILY LOSS LIMIT hit: ${realized:+,.0f} (limit -${DAILY_LOSS_LIMIT_USD:,.0f})\n"
+                              f"No new entries today. Open positions still managed by their exit rules.", 'warning')
+            return False, f'daily_loss_limit_usd (${realized:+,.0f})'
+        if DAILY_PROFIT_TARGET_USD > 0 and realized >= DAILY_PROFIT_TARGET_USD:
+            if not self._daily_target_halted:
+                self._daily_target_halted = True
+                send_telegram(f"🎯 DAILY PROFIT TARGET hit: ${realized:+,.0f} (target +${DAILY_PROFIT_TARGET_USD:,.0f})\n"
+                              f"No new entries today - protecting the win.", 'target')
+            return False, f'daily_profit_target_usd (${realized:+,.0f})'
         start = self.daily_start_equity[symbol]
         if not start:
             return True, 'ok'
