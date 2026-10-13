@@ -106,14 +106,23 @@ class GlobalConfig:
 
     # ----- Entry quality gate -----
     ENTRY_CONVICTION_MARGIN = 0.015      # min |prob - 0.5|
-    MIN_SIGNAL_QUALITY = 0.35            # v3.6: was 0.20 - the 0.20-0.24 "weak" band had no edge (PF 0.59 week)
+    # v3.7.0: RECALIBRATED to the FIXED quality formula (see meta_learner v2.3.0).
+    # Old scale: conviction saturated at 1.0 for |wmean| >= 0.004, so ~20% of all
+    # readings pinned q in a flat 0.43-0.47 plateau and every gate below was
+    # decided by saturation, not merit. New scale measured on 52,373 live
+    # readings (Sep 15 - Oct 13 2026), quality computed from PRE-nudge prob:
+    # stock BUY/SELL signals run p50=0.068 with a strong-evidence plateau at
+    # 0.149-0.165 (top ~35%); crypto runs a smooth gradient p50=0.015, p85=0.029.
+    MIN_SIGNAL_QUALITY = 0.07            # stock floor: passes the top ~43% (was 0.35 on the broken scale)
     QUALITY_MEMORY_REF_N = 80            # v3.6: quality is scaled by min(1, n/this) - thin memories can't enter
 
     # ----- Signal-strength position sizing (quality tiers) -----
-    # v3.6.3: was 0.60 - unreachable (max q ever observed = 0.480), so the
-    # STRONG tier never existed and everything was sized MEDIUM/WEAK.
-    QUALITY_STRONG = 0.45                # quality >= this -> strong tier (~p95 of observed range)
-    QUALITY_MEDIUM = 0.35                # quality >= this -> medium tier (below -> weak tier)
+    # v3.7.0: recalibrated to the fixed quality scale (meta_learner v2.3.0),
+    # measured on 52,373 live readings. STRONG = the strong-evidence plateau
+    # (q >= 0.156, top ~23% of stock signals - wmean ~0.7%/4h with ~3:1
+    # neighbor agreement); MEDIUM = the upper band of the normal population.
+    QUALITY_STRONG = 0.156               # strong-evidence plateau floor
+    QUALITY_MEDIUM = 0.10                # upper normal band
     RISK_PCT_STRONG = 0.020              # 2.0% of slice risked on strong signals
     RISK_PCT_MEDIUM = 0.010              # 1.0%
     RISK_PCT_WEAK = 0.005                # 0.5%  (weak but tradable)
@@ -147,16 +156,14 @@ class GlobalConfig:
     SENTIMENT_VETO_LONG = -0.90          # sent <= this -> LONG needs QUALITY_STRONG
     SENTIMENT_VETO_SHORT = 0.90          # sent >= this -> SHORT needs QUALITY_STRONG
     TOXIC_REGIME_SENT = -0.75            # trend_down AND sent <= this -> LONG needs QUALITY_STRONG
-    # v3.6.3: was 0.60 - DEAD GATE. Measured over 39,570 live brain readings:
-    # max q EVER observed is 0.480, so a 0.60 gate could never fire. 0.45 is
-    # ~p95 of the observed range = genuinely "strong" but actually reachable.
-    TREND_REGIME_MIN_QUALITY = 0.45      # LONG in trend_down (SHORT in trend_up) must be STRONG-tier
+    # v3.7.0: recalibrated to the fixed quality scale (= QUALITY_STRONG).
+    TREND_REGIME_MIN_QUALITY = 0.156     # LONG in trend_down (SHORT in trend_up) must be STRONG-tier
     CRYPTO_MOMENTUM_GATE = True          # crypto LONG needs price > sma200 AND 24h return > 0
-    # v3.6.3: crypto quality runs structurally lower (p90 = 0.21 vs stocks 0.46;
-    # no news feed, different memory). With the 0.35 floor crypto could never
-    # trade. Crypto gets its own floor - the momentum gate + bar confirmations
-    # below do the protective work instead.
-    CRYPTO_MIN_SIGNAL_QUALITY = 0.25     # quality floor for crypto entries (stocks use MIN_SIGNAL_QUALITY)
+    # v3.7.0: recalibrated to the fixed quality scale. Crypto keeps its own
+    # floor - its q is a smooth gradient (no plateau) and structurally lower,
+    # so 0.029 = p85 of crypto signals: selective. The momentum gate + bar
+    # confirmations below do the protective work.
+    CRYPTO_MIN_SIGNAL_QUALITY = 0.029    # quality floor for crypto entries (stocks use MIN_SIGNAL_QUALITY)
     SESSION_OPEN_NO_ENTRY_MINUTES = 60   # no stock entries in the first 60 min of the US session
     ORDER_FILL_TIMEOUT_SECONDS = 90      # was 30s - 4 orders died unfilled at the volatile open
 
@@ -241,6 +248,29 @@ class GlobalConfig:
     # Early-locked trades (stop >= entry, "cannot lose") are free to hold.
     EOD_FLATTEN_ENABLED = True
     EOD_FLATTEN_MINUTES = 30
+    # v3.7.0 (user mandate): stocks are INTRADAY-ONLY - every non-crypto
+    # position closes before the bell, winners included. No overnight exposure.
+    EOD_FLATTEN_ALL_STOCKS = True
+    # v3.7.0: a stock trade opened this late can't breathe before the flatten
+    STOCK_ENTRY_CUTOFF_MINUTES = 60
+
+    # v3.7.0 (user mandate): daily guardrails in USD. Hit either rail ->
+    # no new entries for the rest of the day (existing positions still managed).
+    DAILY_PROFIT_TARGET_USD = 200.0
+    DAILY_LOSS_LIMIT_USD = 300.0
+
+    # v3.7.0 (user mandate): signal-strength sizing. Risk scales from 1.0x at
+    # the entry floor (MIN_SIGNAL_QUALITY) to SIZE_BY_QUALITY_MAX_MULT at
+    # QUALITY_STRONG. Hard notional/buying-power caps still apply after.
+    SIZE_BY_QUALITY_ENABLED = True
+    SIZE_BY_QUALITY_MAX_MULT = 1.5
+
+    # v3.7.0: exhaustion filter (RSI + MACD histogram) - never buy a momentum
+    # top or sell a momentum bottom. Defensive: missing indicator data never
+    # blocks (activates once the indicator set provides rsi_14 / macd_hist).
+    EXHAUSTION_FILTER_ENABLED = True
+    EXHAUSTION_RSI_LONG = 70.0
+    EXHAUSTION_RSI_SHORT = 30.0
     TRAILING_STOP_ACTIVATE_ATR = 2.5     # hard trailing starts at +2.5 ATR (was 4.0 - never fired)
     TRAILING_STOP_DISTANCE_ATR = 2.5     # trail 2.5 ATR behind the peak (was 6.0 - never mattered)
     SCALE_OUT_ENABLED = True             # sell 1/3 at +0.75 ATR and 1/3 at +2 ATR, trail the rest
