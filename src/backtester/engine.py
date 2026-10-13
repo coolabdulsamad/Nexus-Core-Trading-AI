@@ -60,7 +60,7 @@ TIME_LIMIT_ENABLED = True
 
 # v3.6.3: entry confirmation layer + data-calibrated gates (mirrors live).
 # Measured over 39,570 live brain readings: max q EVER = 0.480, so the old
-# 0.60 STRONG gates could never fire; recalibrated to 0.45 in settings.
+# 0.60 STRONG gates could never fire; v3.7.0 recalibrated to the fixed quality scale.
 ENTRY_BAR_CONFIRM = getattr(config, 'ENTRY_BAR_CONFIRM_ENABLED', True)
 ENTRY_BAR_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_BAR_CONFIRM_TOLERANCE_ATR', 0.5)
 ENTRY_VWAP_CONFIRM = getattr(config, 'ENTRY_VWAP_CONFIRM_ENABLED', True)
@@ -68,7 +68,7 @@ ENTRY_VWAP_CONFIRM_TOL_ATR = getattr(config, 'ENTRY_VWAP_CONFIRM_TOLERANCE_ATR',
 ENTRY_NO_CHASE = getattr(config, 'ENTRY_NO_CHASE_ENABLED', True)
 ENTRY_NO_CHASE_MAX_RANGE_ATR = getattr(config, 'ENTRY_NO_CHASE_MAX_RANGE_ATR', 1.5)
 ENTRY_ADX_MIN = getattr(config, 'ENTRY_ADX_MIN', 20.0)
-CRYPTO_MIN_SIGNAL_QUALITY = getattr(config, 'CRYPTO_MIN_SIGNAL_QUALITY', 0.25)
+CRYPTO_MIN_SIGNAL_QUALITY = getattr(config, 'CRYPTO_MIN_SIGNAL_QUALITY', 0.029)
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,8 @@ class BacktesterEngine:
                            blocked_crypto_momentum=0, blocked_loss_cooldown=0,
                            blocked_confirmation=0,
                            conf_bar_confirm=0, conf_vwap_confirm=0,
-                           conf_no_chase=0, conf_adx=0, blocked_memory_floor=0)
+                           conf_no_chase=0, conf_adx=0, blocked_memory_floor=0,
+                           conf_exhaustion=0, blocked_entry_cutoff=0)
 
     def fetch_data(self) -> pd.DataFrame:
         suffix = config.BAR_SUFFIX
@@ -229,6 +230,17 @@ class BacktesterEngine:
             if abs(ret_1) > ENTRY_NO_CHASE_MAX_RANGE_ATR * atr_pct:
                 return False, 'no_chase'
 
+        # v3.7.0: exhaustion filter (mirrors live) - never buy a momentum
+        # top / sell a momentum bottom. Missing indicator data never blocks.
+        if getattr(config, 'EXHAUSTION_FILTER_ENABLED', True):
+            rsi = row.get('rsi_14')
+            macd_h = row.get('macd_hist')
+            if rsi is not None and pd.notna(rsi) and macd_h is not None and pd.notna(macd_h):
+                if side0 == 'LONG' and rsi >= getattr(config, 'EXHAUSTION_RSI_LONG', 70.0) and macd_h < 0:
+                    return False, 'exhaustion'
+                if side0 == 'SHORT' and rsi <= getattr(config, 'EXHAUSTION_RSI_SHORT', 30.0) and macd_h > 0:
+                    return False, 'exhaustion'
+
         if ENTRY_ADX_MIN > 0 and adx is not None and pd.notna(adx):
             with_trend = ((side0 == 'LONG' and price > sma) or (side0 == 'SHORT' and price < sma))
             if with_trend and adx < ENTRY_ADX_MIN:
@@ -259,6 +271,7 @@ class BacktesterEngine:
         if last.get('_counted') is True:
             return
         self.risk.record_realized_pnl(last['pnl'])
+        self._daily_pnl_usd = getattr(self, '_daily_pnl_usd', 0.0) + last['pnl']
         last['_counted'] = True
         if 'stop' in str(last.get('reason', '')).lower():
             self.last_stop_time = t.timestamp()
@@ -307,7 +320,9 @@ class BacktesterEngine:
                 sl0 = _pos_sl(pos)
                 can_lose = (side == 'LONG' and (sl0 is None or sl0 < entry)) or \
                            (side == 'SHORT' and (sl0 is None or sl0 > entry))
-                if can_lose:
+                # v3.7.0 (user mandate): stocks are intraday-only - flatten
+                # EVERYTHING on the last bar of the day, winners included.
+                if getattr(config, 'EOD_FLATTEN_ALL_STOCKS', True) or can_lose:
                     return 'eod_flatten'
 
         # 1.5) Early breakeven-plus lock (v3.6.8, mirrors live): once
@@ -383,6 +398,12 @@ class BacktesterEngine:
             self.risk.reset_daily_if_new_day(t)
             equity = self.risk.capital = self.broker.get_total_equity(price)
 
+            # v3.7.0: account-wide daily USD rails (mirrors live _daily_guard)
+            day = pd.Timestamp(t).date()
+            if getattr(self, '_pnl_day', None) != day:
+                self._pnl_day = day
+                self._daily_pnl_usd = 0.0
+
             # 1. Cooldown
             if self.cooldown > 0:
                 self.cooldown -= 1
@@ -418,10 +439,24 @@ class BacktesterEngine:
                 vol_ok = row['volatility_ratio'] < config.VOLATILITY_RATIO_MAX
             conviction_ok = abs(prob - 0.5) >= config.ENTRY_CONVICTION_MARGIN
             can_trade, day_reason = self.risk.can_open_new_position(equity)
+            # v3.7.0: USD circuit breakers override - bank +$200 / stop -$300
+            if getattr(config, 'DAILY_LOSS_LIMIT_USD', 300.0) > 0 \
+                    and getattr(self, '_daily_pnl_usd', 0.0) <= -config.DAILY_LOSS_LIMIT_USD:
+                can_trade, day_reason = False, 'daily_loss_limit_usd'
+            if getattr(config, 'DAILY_PROFIT_TARGET_USD', 200.0) > 0 \
+                    and getattr(self, '_daily_pnl_usd', 0.0) >= config.DAILY_PROFIT_TARGET_USD:
+                can_trade, day_reason = False, 'daily_profit_target_usd'
 
             # 5. Entry (flat only) - v3.6 gate chain, mirrors live check_entry
             if len(self.broker.open_positions) == 0:
                 proceed = signal in ('BUY', 'SELL')
+                # v3.7.0: stocks are intraday-only - no entry on the last bar
+                # of the day (mirrors live STOCK_ENTRY_CUTOFF_MINUTES)
+                if proceed and '/' not in self.symbol:
+                    nxt = self.df.iloc[idx + 1]['timestamp'] if idx + 1 < len(self.df) else None
+                    if nxt is None or pd.Timestamp(nxt).date() != pd.Timestamp(t).date():
+                        self.funnel['blocked_entry_cutoff'] += 1
+                        proceed = False
                 eff_quality = quality
                 if proceed:
                     side0 = 'LONG' if signal == 'BUY' else 'SHORT'
@@ -452,8 +487,8 @@ class BacktesterEngine:
                     veto_long = getattr(config, 'SENTIMENT_VETO_LONG', -0.90)
                     veto_short = getattr(config, 'SENTIMENT_VETO_SHORT', 0.90)
                     toxic_sent = getattr(config, 'TOXIC_REGIME_SENT', -0.75)
-                    regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45)
-                    strong_q = getattr(config, 'QUALITY_STRONG', 0.45)
+                    regime_min_q = getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.156)
+                    strong_q = getattr(config, 'QUALITY_STRONG', 0.156)
 
                     if self._session_open_blackout(t):
                         self.funnel['blocked_session_open'] += 1
@@ -525,6 +560,13 @@ class BacktesterEngine:
                     else:
                         side = 'LONG' if signal == 'BUY' else 'SHORT'
                         size, sl, tp = self.risk.size_with_tier(price, atr, eff_quality, side)[:3]
+                        # v3.7.0 (mirrors live): scale size by signal strength,
+                        # 1.0x at the entry floor -> MAX_MULT at QUALITY_STRONG
+                        if getattr(config, 'SIZE_BY_QUALITY_ENABLED', True) \
+                                and config.QUALITY_STRONG > config.MIN_SIGNAL_QUALITY:
+                            _frac = min(1.0, max(0.0, (eff_quality - config.MIN_SIGNAL_QUALITY)
+                                                 / (config.QUALITY_STRONG - config.MIN_SIGNAL_QUALITY)))
+                            size = size * (1.0 + (getattr(config, 'SIZE_BY_QUALITY_MAX_MULT', 1.5) - 1.0) * _frac)
                         if size > 0:
                             if side == 'LONG':
                                 self.broker.open_long(t, self.risk.apply_slippage(price, True), size, sl, tp)
@@ -544,6 +586,7 @@ class BacktesterEngine:
                         self.broker._close_position(p, exit_price, t, exit_reason)
                     self.broker.open_positions.clear()
                     self.risk.record_realized_pnl(self.broker.closed_trades[-1]['pnl'])
+                    self._daily_pnl_usd = getattr(self, '_daily_pnl_usd', 0.0) + self.broker.closed_trades[-1]['pnl']
                     self.broker.closed_trades[-1]['_counted'] = True
                     self.cooldown = config.COOLDOWN_BARS
 
@@ -586,7 +629,7 @@ class BacktesterEngine:
         win_rate = len(wins) / len(trades) * 100 if trades else 0
 
         print("\n" + "=" * 60)
-        print(f"HONEST AI BACKTEST v3.6: {self.symbol} ({config.BAR_MINUTES}-min bars)")
+        print(f"HONEST AI BACKTEST v3.7: {self.symbol} ({config.BAR_MINUTES}-min bars)")
         print("=" * 60)
         print(f"Period:         {self.start_date} -> {self.end_date}")
         print(f"Initial:        ${init:,.2f}   Final: ${final:,.2f}   Return: {ret_pct:+.2f}%")
@@ -601,12 +644,13 @@ class BacktesterEngine:
         print(f"  Entries taken:          {f['entries']:<6} (counter-trend allowed: {f['counter_trend_allowed']})")
         print(f"  Blocked by quality:     {f['blocked_quality']:<6} (incl. counter-trend x{COUNTER_TREND_PENALTY} penalty)")
         print(f"  Blocked sentiment veto: {f['blocked_sentiment']:<6} Blocked toxic combo: {f['blocked_toxic_combo']}")
-        print(f"  Blocked counter-regime: {f['blocked_counter_regime']:<6} (needs eff_q >= {getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.45):.2f})")
+        print(f"  Blocked counter-regime: {f['blocked_counter_regime']:<6} (needs eff_q >= {getattr(config, 'TREND_REGIME_MIN_QUALITY', 0.156):.3f})")
         print(f"  Blocked crypto momentum:{f['blocked_crypto_momentum']:<6} Blocked session-open: {f['blocked_session_open']}")
         print(f"  Blocked loss-cooldown:  {f['blocked_loss_cooldown']:<6} Blocked trend-opposed: {f['blocked_trend_opposed']}")
         print(f"  Blocked conviction:     {f['blocked_conviction']:<6} Blocked volatility: {f['blocked_volatility']}")
         print(f"  Blocked confirmation:   {f['blocked_confirmation']:<6} (v3.6.3: bar/VWAP/no-chase/ADX)")
-        print(f"    -> bar: {f['conf_bar_confirm']:<5} vwap: {f['conf_vwap_confirm']:<5} no-chase: {f['conf_no_chase']:<5} adx: {f['conf_adx']}")
+        print(f"    -> bar: {f['conf_bar_confirm']:<5} vwap: {f['conf_vwap_confirm']:<5} no-chase: {f['conf_no_chase']:<5} adx: {f['conf_adx']:<5} exhaustion: {f['conf_exhaustion']}")
+        print(f"  Blocked entry-cutoff:   {f['blocked_entry_cutoff']:<6} (v3.7.0: too close to the bell - stocks are intraday-only)")
         print(f"  Blocked daily-guard:    {f['blocked_daily_guard']:<6} Blocked size: {f['blocked_size']}  Crypto shorts skipped: {f['blocked_crypto_short']}")
         if trades:
             avg_w = np.mean([t['pnl'] for t in wins]) if wins else 0
