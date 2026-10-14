@@ -228,22 +228,22 @@ class GlobalConfig:
     TRAILING_TP_ATR_TRIGGER = 3.0
     TRAILING_TP_DISTANCE_ATR = 1.5
     ENABLE_PROFIT_DRAWDOWN_PROTECTION = True
-    RETRACEMENT_ARM_ATR = 1.25           # v3.7.1: was 2.0 - arm the peak-lock once +1.25 ATR
+    RETRACEMENT_ARM_ATR = 2.0            # v3.7.2: restored - +1.25 strangled winners (AAPL +863 -> +8)
     RETRACEMENT_KEEP_PCT = 0.60          # exit if profit falls to 60% of peak
-    PROFIT_RATCHET_ATR = 1.0             # v3.7.1: was 1.5 - at +1.0 ATR the stop ratchets up ...
+    PROFIT_RATCHET_ATR = 1.5             # v3.7.2: restored - at +1.5 ATR the stop ratchets up ...
     RATCHET_LOCK_ATR = 0.50              # ... to entry + 0.5 ATR (locks real money, not breakeven)
     # v3.6.8: early harvest rung, measured on live MFE (Sep 2026): stock entries
     # typically peak +0.3..+0.8 ATR intraday - CVX peaked +0.80, XOM +0.31, both
     # BELOW every profit mechanism (first rung was +1.0) and decayed to full
     # -2 ATR stop-outs (-$588 combined). Once +0.75 ATR, the stop moves to
     # entry + 0.10 ATR: "started in profit" can no longer become "full loss".
-    # v3.7.1 (user mandate): lock FASTER. The v3.7.0 backtests showed the same
-    # pattern again - NVDA flipped at -1.11% without ever reaching the +0.75
-    # arm. Arm now at +0.45 ATR (inside the measured +0.3..+0.8 MFE band):
-    # nearly every trade that was ever meaningfully green ends green.
+    # v3.7.1 (user mandate): lock FASTER - arm moved inside the MFE band.
+    # v3.7.2 (measured): 0.45/+0.10 was INSIDE the noise - armed trades died on
+    # normal 0.35-ATR pullbacks (AAPL +863 -> +8). 0.60/+0.15 still catches the
+    # NVDA/TSLA fade pattern but lets breathing winners live.
     BREAKEVEN_LOCK_ENABLED = True
-    BREAKEVEN_LOCK_ARM_ATR = 0.45        # arm the early lock at +0.45 ATR (was 0.75)
-    BREAKEVEN_LOCK_PLUS_ATR = 0.10       # stop -> entry + 0.10 ATR (small real lock)
+    BREAKEVEN_LOCK_ARM_ATR = 0.60        # arm the early lock at +0.60 ATR (v3.7.0: 0.75, v3.7.1: 0.45)
+    BREAKEVEN_LOCK_PLUS_ATR = 0.15       # stop -> entry + 0.15 ATR (real lock, survives noise)
     # v3.6.9: overnight gap protection (stocks only). Measured live Sep 2026:
     # CVX/XOM/NVDA all entered fine, faded slowly, then died OVERNIGHT while no
     # exit could execute (-$588 and -$433). Crypto (24/7) has no such trap -
@@ -275,11 +275,11 @@ class GlobalConfig:
     EXHAUSTION_FILTER_ENABLED = True
     EXHAUSTION_RSI_LONG = 70.0
     EXHAUSTION_RSI_SHORT = 30.0
-    TRAILING_STOP_ACTIVATE_ATR = 1.5     # v3.7.1: hard trailing starts at +1.5 ATR (was 2.5)
-    TRAILING_STOP_DISTANCE_ATR = 1.5     # trail 1.5 ATR behind the peak (was 2.5)
-    SCALE_OUT_ENABLED = True             # sell 1/3 at +0.50 ATR and 1/3 at +1.25 ATR, trail the rest
-    SCALE_OUT_1_ATR = 0.50               # v3.7.1: was 0.75 - first banking rung deep inside measured stock MFE
-    SCALE_OUT_2_ATR = 1.25               # v3.7.1: was 2.0
+    TRAILING_STOP_ACTIVATE_ATR = 2.0     # v3.7.2: compromise (v3.7.0: 2.5, v3.7.1: 1.5)
+    TRAILING_STOP_DISTANCE_ATR = 1.5     # trail 1.5 ATR behind the peak (tighter than v3.7.0's 2.5)
+    SCALE_OUT_ENABLED = True             # sell 1/3 at +0.60 ATR and 1/3 at +1.75 ATR, trail the rest
+    SCALE_OUT_1_ATR = 0.60               # v3.7.2: compromise (v3.7.0: 0.75, v3.7.1: 0.50)
+    SCALE_OUT_2_ATR = 1.75               # v3.7.2: compromise (v3.7.0: 2.0, v3.7.1: 1.25)
     SCALE_OUT_PCT = 0.33
     # In-trade re-analysis: the brain re-judges every open position each cycle
     FLIP_EXIT_PROFIT_ATR = 0.5           # brain flips against + profit >= 0.5 ATR -> exit NOW (no 2-flip wait)
