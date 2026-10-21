@@ -77,8 +77,9 @@ def format_eod_report(trades: list, equity: float, day_start_equity: float,
 def format_capital_update(equity: float, day_start_equity: float,
                           peak_equity: float, positions_open: int) -> str:
     day_pct = (equity - day_start_equity) / day_start_equity * 100 if day_start_equity else 0
+    day_usd = equity - day_start_equity if day_start_equity else 0.0
     dd = (peak_equity - equity) / peak_equity * 100 if peak_equity else 0
-    return (f"💓 Equity ${equity:,.2f} ({day_pct:+.2f}% today) | "
+    return (f"💓 Equity ${equity:,.2f} ({day_pct:+.2f}% / ${day_usd:+,.0f} today) | "
             f"DD from peak: {dd:.2f}% | Open positions: {positions_open}")
 
 
