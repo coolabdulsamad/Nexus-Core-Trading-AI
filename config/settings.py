@@ -260,7 +260,12 @@ class GlobalConfig:
 
     # v3.7.0 (user mandate): daily guardrails in USD. Hit either rail ->
     # no new entries for the rest of the day (existing positions still managed).
-    DAILY_PROFIT_TARGET_USD = 200.0
+    # v3.7.3: rails measure TOTAL day P&L (realized + open positions), and on
+    # the profit target all open winners lock at breakeven+ so the banked day
+    # cannot bleed back. Target lowered 200 -> 100 (user: "no greedy") -
+    # measured live week Oct 19-21: best intraday gain was ~+$140, so $100
+    # actually fires on good days instead of never.
+    DAILY_PROFIT_TARGET_USD = 100.0
     DAILY_LOSS_LIMIT_USD = 300.0
 
     # v3.7.0 (user mandate): signal-strength sizing. Risk scales from 1.0x at
