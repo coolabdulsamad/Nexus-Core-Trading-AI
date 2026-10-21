@@ -266,7 +266,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.2"
+TRADER_VERSION = "v3.7.3"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -346,6 +346,13 @@ class MultiSymbolPaperTrader:
         self._last_reset_day = {}
         self._daily_loss_halted = False
         self._daily_target_halted = False
+        # v3.7.3: account-wide rails on TOTAL day P&L (realized + open),
+        # checked once per cycle (see _check_account_rails)
+        self._rail_day = None
+        self._rail_start_equity = None
+        self._last_good_equity = None
+        self._day_pnl_usd = 0.0
+        self.day_lock_set = {s: False for s in self.all_symbols}
         self.daily_target_hit = {s: False for s in self.all_symbols}
         self.time_partial_done = {s: False for s in self.all_symbols}
         self.scale_out_1_done = {s: False for s in self.all_symbols}
@@ -466,6 +473,7 @@ class MultiSymbolPaperTrader:
         self._last_trail_alert[s] = None
         self.retracement_armed[s] = False
         self._last_brain[s] = None
+        self.day_lock_set[s] = False
 
     # ================= Market data =================
     def _get_data_client(self, symbol: str):
@@ -717,6 +725,7 @@ class MultiSymbolPaperTrader:
         self._last_trail_alert[symbol] = None
         self.retracement_armed[symbol] = False
         self._last_brain[symbol] = None
+        self.day_lock_set[symbol] = False
 
     # ================= Broker reconcile / adoption (v3.4) =================
     def _reconcile_positions(self):
@@ -1394,6 +1403,24 @@ class MultiSymbolPaperTrader:
                           f"${self.stop_loss[symbol]:.2f} (entry +{BREAKEVEN_LOCK_PLUS_ATR:.2f} ATR). "
                           f"This trade cannot lose anymore.", 'info')
 
+        # 1.6) Daily-target lock (v3.7.3, user mandate "no greedy"): once the
+        #    account's TOTAL day P&L (realized + open) reaches
+        #    DAILY_PROFIT_TARGET_USD, every open trade that is in profit gets
+        #    its stop lifted to breakeven+pad, so a banked day cannot bleed
+        #    back to red. Positions trading UNDER their lock price keep their
+        #    original stop - they are never force-closed by this rule.
+        if self._daily_target_halted and LOCK_BREAKEVEN_ON_TARGET \
+                and not self.day_lock_set[symbol]:
+            lock_px = (entry * 1.0005) if side == 'LONG' else (entry * 0.9995)
+            can_lock = (side == 'LONG' and price > lock_px and (self.stop_loss[symbol] is None or self.stop_loss[symbol] < lock_px)) or \
+                       (side == 'SHORT' and price < lock_px and (self.stop_loss[symbol] is None or self.stop_loss[symbol] > lock_px))
+            if can_lock:
+                self.stop_loss[symbol] = lock_px
+                self.day_lock_set[symbol] = True
+                logger.info(f"{symbol} daily-target lock: stop -> ${lock_px:.2f} (breakeven+)")
+                send_telegram(f"🎯 {symbol} daily target banked - stop locked at breakeven+ "
+                              f"(${lock_px:.2f}). Win secured; entries halted for today.", 'info')
+
         # 2) Profit ratchet (v3.6 - replaces the breakeven lock, which fired
         #    ZERO times all week): at +PROFIT_RATCHET_ATR the stop jumps to
         #    entry + RATCHET_LOCK_ATR. Real money locked, not breakeven.
@@ -1410,8 +1437,8 @@ class MultiSymbolPaperTrader:
         # 3) Scale-outs (v3.6 - replaces the fixed partial TP): bank a third
         #    at +SCALE_OUT_1_ATR and another at +SCALE_OUT_2_ATR, trail the rest.
         if getattr(config, 'SCALE_OUT_ENABLED', True):
-            for flag, level, label in (('scale_out_1_done', config.SCALE_OUT_1_ATR, f"1/3 @ +{config.SCALE_OUT_1_ATR:.0f} ATR"),
-                                       ('scale_out_2_done', config.SCALE_OUT_2_ATR, f"1/3 @ +{config.SCALE_OUT_2_ATR:.0f} ATR")):
+            for flag, level, label in (('scale_out_1_done', config.SCALE_OUT_1_ATR, f"1/3 @ +{config.SCALE_OUT_1_ATR:.1f} ATR"),
+                                       ('scale_out_2_done', config.SCALE_OUT_2_ATR, f"1/3 @ +{config.SCALE_OUT_2_ATR:.1f} ATR")):
                 done = getattr(self, flag)
                 if not done[symbol] and atr_profit >= level:
                     close_qty = qty * config.SCALE_OUT_PCT
@@ -1583,6 +1610,52 @@ class MultiSymbolPaperTrader:
         return None
 
     # ================= Daily guards =================
+    def _check_account_rails(self, equity: float):
+        """v3.7.3: account-wide daily USD rails on TOTAL day P&L.
+
+        day P&L = equity - day-start equity = realized + open (unrealized).
+        The old version summed only CLOSED P&L and only inside the entry
+        branch, so open profit never counted and the rails could never react
+        while the money was still on the table - the 2026-10-21 give-back.
+
+        Checked once per cycle, every cycle (crypto trades 24/7). On target:
+        halt new entries AND lift every profitable open position's stop to
+        breakeven+ (rule-based protection via the normal exit stack - no
+        arbitrary closes). On limit: halt new entries; open positions keep
+        their stops.
+        """
+        # Equity sanity clamp: on 2026-10-14 Alpaca once returned equity
+        # $200.00 right after startup (self-corrected next read). A corrupt
+        # read must never arm/trip the rails or poison the day baseline.
+        if self._last_good_equity and equity < 0.5 * self._last_good_equity:
+            logger.warning(f"equity read ${equity:,.2f} looks corrupt "
+                           f"(last good ${self._last_good_equity:,.2f}) - rails skipped this cycle")
+            return
+        self._last_good_equity = equity
+        today = datetime.now(timezone.utc).date()
+        if self._rail_day != today:
+            self._rail_day = today
+            self._rail_start_equity = equity
+            self._daily_loss_halted = False
+            self._daily_target_halted = False
+            logger.info(f"Daily rails reset for {today}: start equity ${equity:,.2f} "
+                        f"(target +${DAILY_PROFIT_TARGET_USD:,.0f} / limit -${DAILY_LOSS_LIMIT_USD:,.0f})")
+        day_pnl = equity - self._rail_start_equity
+        self._day_pnl_usd = day_pnl
+        if DAILY_LOSS_LIMIT_USD > 0 and day_pnl <= -DAILY_LOSS_LIMIT_USD:
+            if not self._daily_loss_halted:
+                self._daily_loss_halted = True
+                logger.warning(f"DAILY LOSS LIMIT hit: day P&L ${day_pnl:+,.0f} - entries halted")
+                send_telegram(f"🛑 DAILY LOSS LIMIT hit: ${day_pnl:+,.0f} (limit -${DAILY_LOSS_LIMIT_USD:,.0f})\n"
+                              f"No new entries today. Open positions still managed by their exit rules.", 'warning')
+        elif DAILY_PROFIT_TARGET_USD > 0 and day_pnl >= DAILY_PROFIT_TARGET_USD:
+            if not self._daily_target_halted:
+                self._daily_target_halted = True
+                logger.info(f"DAILY PROFIT TARGET hit: day P&L ${day_pnl:+,.0f} - entries halted, "
+                            f"open winners locking at breakeven+")
+                send_telegram(f"🎯 DAILY PROFIT TARGET hit: ${day_pnl:+,.0f} (target +${DAILY_PROFIT_TARGET_USD:,.0f})\n"
+                              f"No new entries today - open winners lock at breakeven+ so the win can't bleed back.", 'target')
+
     def _check_daily_reset(self, symbol: str, equity: float):
         today = datetime.now(timezone.utc).date()
         # v3.7.0 fix: the old code used ONE global _last_reset flag - only the
@@ -1598,27 +1671,17 @@ class MultiSymbolPaperTrader:
             self.daily_target_hit[symbol] = False
             self.daily_trades[symbol] = []
             self._last_reset_day[symbol] = today
-            # account-wide USD rails reset with the new day
-            self._daily_loss_halted = False
-            self._daily_target_halted = False
+            # v3.7.3: the account-wide USD rail flags reset in
+            # _check_account_rails (once per cycle, before the symbol loop).
 
     def _daily_guard(self, symbol: str, equity: float) -> Tuple[bool, str]:
-        # v3.7.0 (user mandate): account-wide USD circuit breakers, checked
-        # FIRST. Hit +$200 realized -> bank the day; hit -$300 realized ->
-        # stop the bleeding. Open positions keep their normal exit rules.
-        realized = sum(self.daily_realized_pnl.values())
-        if DAILY_LOSS_LIMIT_USD > 0 and realized <= -DAILY_LOSS_LIMIT_USD:
-            if not self._daily_loss_halted:
-                self._daily_loss_halted = True
-                send_telegram(f"🛑 DAILY LOSS LIMIT hit: ${realized:+,.0f} (limit -${DAILY_LOSS_LIMIT_USD:,.0f})\n"
-                              f"No new entries today. Open positions still managed by their exit rules.", 'warning')
-            return False, f'daily_loss_limit_usd (${realized:+,.0f})'
-        if DAILY_PROFIT_TARGET_USD > 0 and realized >= DAILY_PROFIT_TARGET_USD:
-            if not self._daily_target_halted:
-                self._daily_target_halted = True
-                send_telegram(f"🎯 DAILY PROFIT TARGET hit: ${realized:+,.0f} (target +${DAILY_PROFIT_TARGET_USD:,.0f})\n"
-                              f"No new entries today - protecting the win.", 'target')
-            return False, f'daily_profit_target_usd (${realized:+,.0f})'
+        # v3.7.3: the account-wide USD rails now run once per cycle in
+        # _check_account_rails (on TOTAL day P&L, realized + open) and set
+        # these flags; here they gate ENTRIES only.
+        if self._daily_loss_halted:
+            return False, f'daily_loss_limit_usd (day ${self._day_pnl_usd:+,.0f})'
+        if self._daily_target_halted:
+            return False, f'daily_profit_target_usd (day ${self._day_pnl_usd:+,.0f})'
         start = self.daily_start_equity[symbol]
         if not start:
             return True, 'ok'
@@ -1664,8 +1727,11 @@ class MultiSymbolPaperTrader:
             equity = float(account.equity)
             self._peak_equity = max(self._peak_equity, equity)
             open_syms = [s for s in self.all_symbols if self.in_position.get(s)]
+            # v3.7.3: prefer the rail's day baseline (same number the USD
+            # target/limit use), so the heartbeat's "today" matches the rails.
+            day_start = self._rail_start_equity or self._day_start_equity(equity)
             send_telegram(format_capital_update(
-                equity, self._day_start_equity(equity), self._peak_equity,
+                equity, day_start, self._peak_equity,
                 len(open_syms)), 'heartbeat')
         except Exception as e:
             logger.error(f"Heartbeat failed: {e}")
@@ -1777,6 +1843,10 @@ class MultiSymbolPaperTrader:
                 account = self.get_account()
                 equity = float(account.equity)
                 self._last_equity = equity
+                # v3.7.3: account-wide daily USD rails, every cycle (also
+                # while positions are open and when the stock market is
+                # closed - crypto trades 24/7).
+                self._check_account_rails(equity)
                 market_open = self._market_open()
                 # v3.6.9: cache the clock once per cycle for the EOD-flatten check
                 try:
