@@ -268,6 +268,31 @@ class GlobalConfig:
     DAILY_PROFIT_TARGET_USD = 100.0
     DAILY_LOSS_LIMIT_USD = 300.0
 
+    # v3.7.4 (user mandate: stop the bleed, small green days over big swings):
+    # 1) Correlation clusters - one open position per cluster. GS+JPM and V+MA
+    #    doubled the SAME bet three times in the Oct 27-30 week (~-$600).
+    CORRELATION_CLUSTERS = {
+        'payments': ['V', 'MA'],
+        'banks': ['GS', 'JPM', 'BAC'],
+        'semis': ['NVDA', 'AMD', 'MU', 'AVGO', 'INTC'],
+        'mega_tech': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NFLX'],
+        'energy': ['XOM', 'CVX'],
+        'crypto_beta': ['BTC/USD', 'ETH/USD', 'SOL/USD', 'MSTR', 'COIN'],
+    }
+    MAX_OPEN_PER_CLUSTER = 1
+    # 2) Fighting the regime needs real neighbor agreement, not a coin flip -
+    #    every Oct 27-30 loser was a counter-regime BUY at agree ~0.50.
+    COUNTER_REGIME_MIN_AGREEMENT = 0.55
+    # 3) Crypto entries need a minimum of agreement too (Oct 21 ETH/BTC stops
+    #    entered on agree +0.22/+0.18 = 4:1 evidence AGAINST the trade).
+    CRYPTO_MIN_AGREEMENT = 0.35
+    # 4) When the daily loss rail trips, open positions go on a tight leash
+    #    instead of keeping the full -2 ATR stop (Oct 30: -303 rail, -663 close).
+    LOSS_RAIL_LEASH_ATR = 0.75
+    # 5) Watchdog: exit for supervisor restart if no cycle completes (silent
+    #    network hangs froze the trader Oct 27 and Oct 30).
+    WATCHDOG_STALE_SECONDS = 900
+
     # v3.7.0 (user mandate): signal-strength sizing. Risk scales from 1.0x at
     # the entry floor (MIN_SIGNAL_QUALITY) to SIZE_BY_QUALITY_MAX_MULT at
     # QUALITY_STRONG. Hard notional/buying-power caps still apply after.
