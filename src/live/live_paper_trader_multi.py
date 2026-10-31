@@ -266,7 +266,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.3"
+TRADER_VERSION = "v3.7.4"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -353,6 +353,8 @@ class MultiSymbolPaperTrader:
         self._last_good_equity = None
         self._day_pnl_usd = 0.0
         self.day_lock_set = {s: False for s in self.all_symbols}
+        self._loss_leash_alerted = {s: False for s in self.all_symbols}
+        self._cycle_heartbeat = time.time()
         self.daily_target_hit = {s: False for s in self.all_symbols}
         self.time_partial_done = {s: False for s in self.all_symbols}
         self.scale_out_1_done = {s: False for s in self.all_symbols}
@@ -474,6 +476,7 @@ class MultiSymbolPaperTrader:
         self.retracement_armed[s] = False
         self._last_brain[s] = None
         self.day_lock_set[s] = False
+        self._loss_leash_alerted[s] = False
 
     # ================= Market data =================
     def _get_data_client(self, symbol: str):
@@ -685,7 +688,10 @@ class MultiSymbolPaperTrader:
         if self.entry_bar_time[symbol]:
             hold_h = (datetime.now(timezone.utc) - self.entry_bar_time[symbol]).total_seconds() / 3600.0
         # v3.6: stop-outs feed the loss-cooldown memory
-        if reason == 'STOP_LOSS':
+        # v3.7.4: ANY losing close feeds it, not just STOP_LOSS - V/MA kept
+        # getting re-entered after losing EOD_FLATTENs because those losses
+        # were never counted (only V's final -$188 stop was).
+        if reason == 'STOP_LOSS' or pnl < 0:
             self.last_stop_time[symbol] = time.time()
             self.stop_history.setdefault(symbol, []).append(time.time())
             cutoff = time.time() - config.REPEAT_LOSS_WINDOW_DAYS * 86400
@@ -726,6 +732,7 @@ class MultiSymbolPaperTrader:
         self.retracement_armed[symbol] = False
         self._last_brain[symbol] = None
         self.day_lock_set[symbol] = False
+        self._loss_leash_alerted[symbol] = False
 
     # ================= Broker reconcile / adoption (v3.4) =================
     def _reconcile_positions(self):
@@ -967,8 +974,9 @@ class MultiSymbolPaperTrader:
     # ================= Entry =================
     @staticmethod
     def _parse_reason(reason: str):
-        """Pull regime / sentiment / memory depth out of the brain's reason string."""
-        regime, sent, n = '', 0.0, 0
+        """Pull regime / sentiment / memory depth / neighbor agreement out of
+        the brain's reason string."""
+        regime, sent, n, agree = '', 0.0, 0, 0.0
         m = re.search(r'regime=(\w+)', reason or '')
         if m:
             regime = m.group(1)
@@ -978,7 +986,10 @@ class MultiSymbolPaperTrader:
         m = re.search(r'n=(\d+)', reason or '')
         if m:
             n = int(m.group(1))
-        return regime, sent, n
+        m = re.search(r'agree=([+-]?[\d\.]+)', reason or '')
+        if m:
+            agree = float(m.group(1))
+        return regime, sent, n, agree
 
     def _session_open_blackout(self, symbol: str) -> bool:
         """v3.6: no stock entries in the first SESSION_OPEN_NO_ENTRY_MINUTES of
@@ -1110,7 +1121,7 @@ class MultiSymbolPaperTrader:
         if sma is None or np.isnan(sma):
             return None, 0.0, 'no_sma'
 
-        regime, sent, n_mem = self._parse_reason(reason)
+        regime, sent, n_mem, agree = self._parse_reason(reason)
 
         # v3.6.7: memory depth is a FLOOR, not a scaler. The old eff_q =
         # q x (n/80) made entry mathematically impossible for stocks (n=35
@@ -1158,10 +1169,27 @@ class MultiSymbolPaperTrader:
                 logger.info(f"{symbol} | {signal} q={quality:.3f} eff={eff_quality:.3f} BLOCKED: "
                             f"counter-regime entries must be STRONG (>= {regime_min_q:.2f})")
                 return None, eff_quality, reason
+            # v3.7.4: fighting the regime needs PROOF, not a coin flip. Every
+            # loser in the Oct 27-30 bleed (GS/JPM/V/MA/BA) was a counter-regime
+            # BUY with agree ~0.49-0.50 - half the similar past setups lost.
+            min_agree_cr = getattr(config, 'COUNTER_REGIME_MIN_AGREEMENT', 0.55)
+            if ((side0 == 'LONG' and regime == 'trend_down') or
+                    (side0 == 'SHORT' and regime == 'trend_up')) and agree < min_agree_cr:
+                logger.info(f"{symbol} | {signal} q={quality:.3f} BLOCKED: counter-regime agreement "
+                            f"too weak ({agree:+.2f} < {min_agree_cr:.2f} - coin-flip evidence in a falling tape)")
+                return None, eff_quality, reason
             if side0 == 'LONG' and self._is_crypto(symbol) and not self._crypto_momentum_ok(symbol, df, price, sma):
                 logger.info(f"{symbol} | BUY q={quality:.3f} BLOCKED: crypto momentum gate "
                             f"(need price > 200-bar avg AND 24h return > 0)")
                 return None, eff_quality, reason
+            # v3.7.4: crypto entries need a minimum of neighbor agreement too -
+            # the Oct 21 ETH/BTC stops entered on agree +0.22/+0.18 (4:1 against).
+            if side0 == 'LONG' and self._is_crypto(symbol):
+                min_agree_crypto = getattr(config, 'CRYPTO_MIN_AGREEMENT', 0.35)
+                if agree < min_agree_crypto:
+                    logger.info(f"{symbol} | BUY q={quality:.3f} BLOCKED: crypto agreement too weak "
+                                f"({agree:+.2f} < {min_agree_crypto:.2f})")
+                    return None, eff_quality, reason
             # v3.6.3: the tape itself must agree (bar / VWAP / no-chase / ADX / vol filter)
             ok, why = self._entry_confirmation(symbol, side0, latest, price, sma)
             if not ok:
@@ -1220,11 +1248,31 @@ class MultiSymbolPaperTrader:
             return f"stop-out cooldown ({(wait - (now - last)) / 3600:.0f}h left)"
         return None
 
+    def _cluster_of(self, symbol: str) -> str:
+        """v3.7.4: correlation cluster name for a symbol ('' = no cluster)."""
+        for name, members in getattr(config, 'CORRELATION_CLUSTERS', {}).items():
+            if symbol in members:
+                return name
+        return ''
+
     def enter_position(self, symbol: str, side: str, quality: float, reason: str = ''):
         ban = self._loss_cooldown_active(symbol)
         if ban:
             logger.info(f"{symbol} entry skipped: {ban}")
             return
+        # v3.7.4: correlation cluster cap. GS+JPM and V+MA doubled the SAME
+        # bet three times in the Oct 27-30 week (~-$600); a cluster is one
+        # idea, so it gets one position. Adopted/already-open positions are
+        # never touched by this - it gates NEW entries only.
+        cluster = self._cluster_of(symbol)
+        if cluster:
+            cap = int(getattr(config, 'MAX_OPEN_PER_CLUSTER', 1))
+            open_mates = [s for s in getattr(config, 'CORRELATION_CLUSTERS', {}).get(cluster, [])
+                          if s != symbol and self.in_position.get(s)]
+            if len(open_mates) >= cap:
+                logger.info(f"{symbol} entry skipped: cluster '{cluster}' already has "
+                            f"{', '.join(open_mates)} open (same bet, cap {cap})")
+                return
         # Full bar window: calculate_all_indicators() dropna()s the 200-bar
         # warm-up, so a short window returns an EMPTY frame (the v3.2 bug
         # that silently killed every entry).
@@ -1302,7 +1350,7 @@ class MultiSymbolPaperTrader:
         tp_distance = STOP_ATR_MULT * REWARD_RISK_RATIO * atr
         self.take_profit[symbol] = (price + tp_distance) if side == 'LONG' else (price - tp_distance)
 
-        _reg, _sent, _n = self._parse_reason(reason)
+        _reg, _sent, _n, _agree = self._parse_reason(reason)
         send_telegram(
             f"{symbol} {side} ENTRY\n"
             f"Price: ${price:.2f} | Qty: {actual_qty}\n"
@@ -1420,6 +1468,27 @@ class MultiSymbolPaperTrader:
                 logger.info(f"{symbol} daily-target lock: stop -> ${lock_px:.2f} (breakeven+)")
                 send_telegram(f"🎯 {symbol} daily target banked - stop locked at breakeven+ "
                               f"(${lock_px:.2f}). Win secured; entries halted for today.", 'info')
+
+        # 1.7) Loss-rail leash (v3.7.4): when the daily loss limit trips, open
+        #    positions go on a tight leash (trail LOSS_RAIL_LEASH_ATR behind
+        #    price) instead of keeping the full -2 ATR stop. Oct 30: the rail
+        #    halted entries at -$303 but GS/JPM bled on to -$663 at their far
+        #    stops. Rule-based tightening only (max/min, never loosens) - not
+        #    an arbitrary close; price touching the leash is a normal stop-out.
+        leash_atr = getattr(config, 'LOSS_RAIL_LEASH_ATR', 0.75)
+        if self._daily_loss_halted and leash_atr > 0 and not self.day_lock_set[symbol]:
+            leash = (price - leash_atr * atr) if side == 'LONG' else (price + leash_atr * atr)
+            cur = self.stop_loss[symbol]
+            tighter = (side == 'LONG' and (cur is None or leash > cur)) or \
+                      (side == 'SHORT' and (cur is None or leash < cur))
+            if tighter:
+                self.stop_loss[symbol] = leash
+                if not self._loss_leash_alerted.get(symbol):
+                    self._loss_leash_alerted[symbol] = True
+                    logger.info(f"{symbol} loss-rail leash: stop tightened to ${leash:.2f} "
+                                f"(trail {leash_atr:.2f} ATR - daily loss limit active)")
+                    send_telegram(f"🛑 {symbol} daily loss limit active - stop tightened to "
+                                  f"${leash:.2f} (trail {leash_atr:.2f} ATR). Cutting the day's tail.", 'info')
 
         # 2) Profit ratchet (v3.6 - replaces the breakeven lock, which fired
         #    ZERO times all week): at +PROFIT_RATCHET_ATR the stop jumps to
@@ -1608,6 +1677,36 @@ class MultiSymbolPaperTrader:
                         f"({atr_profit:+.2f} ATR) stop=${stop:.2f} brain={brain_txt}")
 
         return None
+
+    # ================= Watchdog (v3.7.4) =================
+    def _start_watchdog(self):
+        """v3.7.4 (user mandate): the trader must survive network flaps WITHOUT
+        manual restarts. API errors are already retried by the main loop, but a
+        silent socket HANG is not an exception - it froze the process twice
+        (Oct 27 20:44, Oct 30 19:28) and trading silently stopped until a
+        manual restart. This thread watches the per-cycle heartbeat: if no
+        cycle completes for WATCHDOG_STALE_SECONDS it exits with code 42 so the
+        supervisor wrapper (run_trader.sh) restarts the process. Open positions
+        are re-adopted on boot - a restart is safe."""
+        import threading
+        stale_limit = getattr(config, 'WATCHDOG_STALE_SECONDS', 900)
+
+        def _watch():
+            while True:
+                time.sleep(60)
+                stale = time.time() - getattr(self, '_cycle_heartbeat', time.time())
+                if stale > stale_limit:
+                    logger.error(f"WATCHDOG: no cycle completed for {stale / 60:.0f} min "
+                                 f"(hung network call?) - exiting for supervisor restart")
+                    try:
+                        send_telegram(f"⚠️ Trader froze (no cycle for {stale / 60:.0f} min, likely a hung "
+                                      f"network call) - auto-restarting now. Positions will be re-adopted.", 'warning')
+                    except Exception:
+                        pass
+                    os._exit(42)
+
+        threading.Thread(target=_watch, daemon=True).start()
+        logger.info(f"Watchdog armed: restart if no cycle for {stale_limit // 60} min")
 
     # ================= Daily guards =================
     def _check_account_rails(self, equity: float):
@@ -1833,6 +1932,8 @@ class MultiSymbolPaperTrader:
             except Exception as e:
                 logger.error(f"startup EOD sweep failed: {e}", exc_info=True)
 
+        self._start_watchdog()
+
         while True:
             try:
                 self.cycle_count += 1
@@ -1887,6 +1988,7 @@ class MultiSymbolPaperTrader:
                     if self.last_report_date != datetime.now(timezone.utc).date():
                         self._send_eod()
 
+                self._cycle_heartbeat = time.time()   # v3.7.4 watchdog stamp
                 time.sleep(CHECK_INTERVAL)
 
             except KeyboardInterrupt:
@@ -1894,6 +1996,10 @@ class MultiSymbolPaperTrader:
                 send_telegram("Trader stopped by user", 'warning')
                 break
             except Exception as e:
+                # v3.7.4: an error means we're ALIVE and retrying - stamp the
+                # watchdog here too so a long outage never triggers a restart;
+                # only a true silent hang does.
+                self._cycle_heartbeat = time.time()
                 logger.error(f"Main loop error: {e}")
                 time.sleep(60)
 
