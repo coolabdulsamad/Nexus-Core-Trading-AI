@@ -266,7 +266,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.4"
+TRADER_VERSION = "v3.7.5"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -350,6 +350,7 @@ class MultiSymbolPaperTrader:
         # checked once per cycle (see _check_account_rails)
         self._rail_day = None
         self._rail_start_equity = None
+        self._rail_start_pending = None
         self._last_good_equity = None
         self._day_pnl_usd = 0.0
         self.day_lock_set = {s: False for s in self.all_symbols}
@@ -1733,8 +1734,27 @@ class MultiSymbolPaperTrader:
         self._last_good_equity = equity
         today = datetime.now(timezone.utc).date()
         if self._rail_day != today:
+            # v3.7.5 fix: the day baseline is set ONCE per day, and on 2026-10-31
+            # the corrupt "$200.00" Alpaca read hit on the FIRST read after boot
+            # (before _last_good_equity existed, so the clamp above couldn't catch
+            # it) and poisoned the baseline: day P&L became +$98k and the profit
+            # target fake-tripped, halting entries all day. Require TWO
+            # consecutive reads within 10% of each other before accepting the
+            # baseline; a single bad read can no longer set it.
+            pending = self._rail_start_pending
+            if pending is None:
+                self._rail_start_pending = equity
+                logger.info(f"rails baseline for {today}: first read ${equity:,.2f} - "
+                            f"waiting for a confirming read before arming")
+                return
+            if abs(equity - pending) > 0.10 * max(equity, pending):
+                logger.warning(f"rails baseline for {today}: reads disagree "
+                               f"(${pending:,.2f} vs ${equity:,.2f}) - resetting baseline check")
+                self._rail_start_pending = equity
+                return
             self._rail_day = today
             self._rail_start_equity = equity
+            self._rail_start_pending = None
             self._daily_loss_halted = False
             self._daily_target_halted = False
             logger.info(f"Daily rails reset for {today}: start equity ${equity:,.2f} "
