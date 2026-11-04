@@ -137,6 +137,7 @@ import logging
 import re
 import json
 import subprocess
+import threading
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -268,7 +269,15 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.6"
+TRADER_VERSION = "v3.7.7"
+
+# v3.7.7 (user mandate "check every second, close fast, close before the
+# bell"): a lightweight fast-watch thread checks the equity rails and every
+# open position's hard SL/TP + EOD-flatten window every FAST_WATCH_SECONDS,
+# instead of waiting up to ~7 min for the slow full cycle to come around.
+# It only ever fires rules the exit stack already owns (hard stop, TP,
+# EOD flatten, daily rails) - never arbitrary closes.
+FAST_WATCH_SECONDS = int(os.getenv("FAST_WATCH_SECONDS", "30"))
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -406,6 +415,15 @@ class MultiSymbolPaperTrader:
         self._saved_state = self._load_state()
         self._last_saved_json = ""
         self._restore_rails_from_state()
+
+        # v3.7.7: the 30s fast-watch thread runs alongside the 5-min main
+        # cycle - closes, rails and state writes must be serialized so the
+        # two threads can never double-close a position or interleave a
+        # state-file write. Lock order is always rails -> close -> state.
+        self._close_lock = threading.Lock()
+        self._rails_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._eod_window_logged = None
 
         # Adopt any positions the broker already holds (opened before this
         # process started - restart, crash, or manual). They are managed
@@ -569,7 +587,15 @@ class MultiSymbolPaperTrader:
     def _positions_map(self) -> Dict[str, float]:
         out = {}
         for p in self.trading_client.get_all_positions():
-            out[p.symbol] = float(p.qty) if p.side.value == 'long' else -float(p.qty)
+            # v3.7.7 fix: Alpaca reports a short position's qty as NEGATIVE
+            # (qty="-4", side="short"). The old code did -float(p.qty) for
+            # shorts -> -(-4) = +4, so every short was read as a LONG
+            # (2026-11-04 MU: bot managed a real SHORT as LONG, placed a
+            # SELL disaster stop under it, and its "close" would have sold
+            # MORE into the short). abs() is correct under both conventions
+            # (qty signed or unsigned, the side field is authoritative).
+            q = abs(float(p.qty))
+            out[p.symbol] = q if p.side.value == 'long' else -q
         return out
 
     def get_position_qty(self, symbol: str) -> float:
@@ -627,6 +653,15 @@ class MultiSymbolPaperTrader:
             return False
 
     def close_position(self, symbol: str, qty: float, reason: str) -> bool:
+        """v3.7.7: serialized. The 30s fast-watch and the 5-min main cycle can
+        both decide to close the same position at the same moment; without
+        this lock both could pass the broker-qty check and the second order
+        would over-close into a flip. The second caller now waits, then sees
+        the broker flat and stands down."""
+        with self._close_lock:
+            return self._close_position_impl(symbol, qty, reason)
+
+    def _close_position_impl(self, symbol: str, qty: float, reason: str) -> bool:
         # v3.5.2: the close direction comes from the BROKER's live signed
         # qty, never from tracked state. During the PLTR pile-up the tracked
         # side was briefly wrong, which turned "closes" into orders in the
@@ -780,6 +815,11 @@ class MultiSymbolPaperTrader:
         return {}
 
     def _save_state(self):
+        """v3.7.7: serialized - fast-watch and the main cycle both save."""
+        with self._state_lock:
+            self._save_state_impl()
+
+    def _save_state_impl(self):
         """Persist the day rails and every open position's bracket + lock
         flags, atomically, so a restart/power loss never forgets them.
         Skips the write when nothing changed."""
@@ -941,7 +981,9 @@ class MultiSymbolPaperTrader:
 
         broker = {}
         for p in positions:
-            q = float(p.qty)
+            # v3.7.7: same double-negation fix as _positions_map - short qty
+            # arrives negative from Alpaca; abs() + side field is correct.
+            q = abs(float(p.qty))
             broker[p.symbol] = (q if p.side.value == 'long' else -q,
                                 float(p.avg_entry_price))
 
@@ -1949,8 +1991,125 @@ class MultiSymbolPaperTrader:
         threading.Thread(target=_watch, daemon=True).start()
         logger.info(f"Watchdog armed: restart if no cycle for {stale_limit // 60} min")
 
+    # ================= Fast-watch (v3.7.7) =================
+    def _start_fast_watch(self):
+        """v3.7.7 (user mandate: "check every second, know the live amount,
+        close fast, close before the bell"): the full cycle sleeps 5 min and
+        walks 40 symbols (~7 min between checks of the same position), which
+        is far too slow for the daily profit target, hard stops and the EOD
+        flatten. This thread checks ONLY the cheap, safety-critical things
+        every FAST_WATCH_SECONDS: account rails (1 API call) and, for each
+        open position, the hard SL/TP and the EOD window (1 clock call +
+        1 price call per position). It fires ONLY rules the exit stack
+        already owns - never an arbitrary close."""
+        def _watch():
+            while True:
+                try:
+                    self._fast_watch_cycle()
+                except Exception as e:
+                    logger.error(f"fast-watch error: {e}")
+                time.sleep(FAST_WATCH_SECONDS)
+        threading.Thread(target=_watch, daemon=True).start()
+        logger.info(f"Fast-watch armed: rails + open-position SL/TP + EOD every {FAST_WATCH_SECONDS}s")
+        send_telegram(f"⚡ Fast-watch armed: profit target, stops and the EOD flatten are now "
+                      f"checked every {FAST_WATCH_SECONDS} seconds (not every ~7 min).", 'info')
+
+    def _fast_watch_cycle(self):
+        # 1) Account rails - the daily profit target / loss limit now reacts
+        #    within FAST_WATCH_SECONDS of the live equity crossing the line.
+        try:
+            equity = float(self.get_account().equity)
+            self._last_equity = equity
+            self._check_account_rails(equity)
+        except Exception as e:
+            logger.error(f"fast-watch rails check failed: {e}")
+
+        open_syms = [s for s in list(self.all_symbols) if self.in_position.get(s)]
+        if not open_syms:
+            return
+
+        # 2) Clock once per tick; EOD math failures are logged LOUDLY now
+        #    (the old main-cycle branch swallowed them, which is how the
+        #    flatten could be skipped with zero trace).
+        clock = None
+        try:
+            clock = self.trading_client.get_clock()
+        except Exception as e:
+            logger.error(f"fast-watch clock fetch failed: {e}")
+        if clock is not None:
+            market_open = bool(getattr(clock, 'is_open', False))
+        else:
+            market_open = self._market_open()
+        mins_left = None
+        if clock is not None and market_open:
+            try:
+                mins_left = (clock.next_close - datetime.now(timezone.utc)).total_seconds() / 60
+            except Exception as e:
+                logger.error(f"fast-watch EOD clock math failed: {e}")
+                mins_left = None
+
+        # One visible log+telegram when the EOD window opens each day, so the
+        # flatten is provable instead of silent.
+        today = datetime.now(timezone.utc).date()
+        if mins_left is not None and 0 < mins_left <= EOD_FLATTEN_MINUTES \
+                and self._eod_window_logged != today:
+            self._eod_window_logged = today
+            n = sum(1 for s in open_syms if not self._is_crypto(s))
+            logger.info(f"EOD flatten window OPEN: {mins_left:.0f} min to the bell - "
+                        f"{n} stock position(s) marked for flattening")
+            if n:
+                send_telegram(f"⏰ EOD flatten window open - {mins_left:.0f} min to the bell. "
+                              f"Flattening {n} stock position(s) at market now.", 'info')
+
+        # 3) Per-position hard SL/TP + EOD flatten
+        for symbol in open_syms:
+            try:
+                is_crypto = self._is_crypto(symbol)
+                if not is_crypto and not market_open:
+                    continue
+                side = self.position_side.get(symbol)
+                if side not in ('LONG', 'SHORT'):
+                    continue
+                stop = self.stop_loss.get(symbol)
+                tp = self.take_profit.get(symbol)
+                price = self.get_latest_price(symbol)
+                if price is None:
+                    continue
+                reason = None
+                if side == 'LONG':
+                    if stop and price <= stop:
+                        reason = 'STOP_LOSS'
+                    elif tp and price >= tp:
+                        reason = 'TAKE_PROFIT'
+                else:
+                    if stop and price >= stop:
+                        reason = 'STOP_LOSS'
+                    elif tp and price <= tp:
+                        reason = 'TAKE_PROFIT'
+                if reason is None and not is_crypto and EOD_FLATTEN_ENABLED \
+                        and mins_left is not None and 0 < mins_left <= EOD_FLATTEN_MINUTES:
+                    entry = self.entry_price.get(symbol) or 0.0
+                    can_lose = (side == 'LONG' and (stop is None or stop < entry)) or \
+                               (side == 'SHORT' and (stop is None or stop > entry))
+                    if EOD_FLATTEN_ALL_STOCKS or can_lose:
+                        reason = 'EOD_FLATTEN'
+                if reason:
+                    logger.info(f"{symbol} FAST-WATCH {reason} @ ${price:.2f} "
+                                f"(stop={stop} tp={tp}) - closing now")
+                    qty = abs(self.get_position_qty(symbol))
+                    if qty > 0:
+                        self.close_position(symbol, qty, reason)
+            except Exception as e:
+                logger.error(f"{symbol} fast-watch error: {e}")
+
     # ================= Daily guards =================
     def _check_account_rails(self, equity: float):
+        """v3.7.7: serialized - called by the main cycle AND the 30s
+        fast-watch; the target/limit trip must fire exactly once."""
+        with self._rails_lock:
+            self._check_account_rails_impl(equity)
+
+    def _check_account_rails_impl(self, equity: float):
         """v3.7.3: account-wide daily USD rails on TOTAL day P&L.
 
         day P&L = equity - day-start equity = realized + open (unrealized).
@@ -2205,6 +2364,7 @@ class MultiSymbolPaperTrader:
                 logger.error(f"startup EOD sweep failed: {e}", exc_info=True)
 
         self._start_watchdog()
+        self._start_fast_watch()
 
         while True:
             try:
