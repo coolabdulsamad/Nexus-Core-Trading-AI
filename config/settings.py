@@ -358,6 +358,23 @@ class GlobalConfig:
     TELEGRAM_EOD_REPORT = True           # end-of-day analysis report
     TELEGRAM_HEARTBEAT_CYCLES = 6        # equity heartbeat every N cycles (~30 min)
 
+    # ----- v3.7.6: durability + phone alarms -----
+    # A REAL stop order rests at Alpaca for every stock position, so
+    # protection survives laptop power loss / internet outage / crashes.
+    SERVER_SIDE_STOPS_ENABLED = True
+    # When the daily profit target trips, market-close every position that is
+    # in profit immediately (bank the day). Red positions keep their rules.
+    CLOSE_WINNERS_ON_TARGET = True
+    # Where the day rails + open-position brackets are persisted so restarts
+    # never forget the baseline, the halt flags, or a locked stop.
+    STATE_FILE = "data/live_state.json"
+    # Phone alarms (keys live in .env, never here):
+    #   PUSHOVER_APP_TOKEN / PUSHOVER_USER_KEY  -> ringing critical alerts
+    #   HEALTHCHECK_PING_URL                    -> dead-man's switch ping
+    PUSHOVER_APP_TOKEN = os.getenv("PUSHOVER_APP_TOKEN", "")
+    PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")
+    HEALTHCHECK_PING_URL = os.getenv("HEALTHCHECK_PING_URL", "")
+
     # ----- Misc -----
     WIN_RATE_WINDOW = 20
     ENABLE_DYNAMIC_THRESHOLDS = False
