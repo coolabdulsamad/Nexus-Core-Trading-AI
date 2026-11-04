@@ -269,7 +269,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.7"
+TRADER_VERSION = "v3.7.8"
 
 # v3.7.7 (user mandate "check every second, close fast, close before the
 # bell"): a lightweight fast-watch thread checks the equity rails and every
@@ -424,6 +424,7 @@ class MultiSymbolPaperTrader:
         self._rails_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._eod_window_logged = None
+        self._fw_log_ts = 0.0
 
         # Adopt any positions the broker already holds (opened before this
         # process started - restart, crash, or manual). They are managed
@@ -2017,6 +2018,7 @@ class MultiSymbolPaperTrader:
     def _fast_watch_cycle(self):
         # 1) Account rails - the daily profit target / loss limit now reacts
         #    within FAST_WATCH_SECONDS of the live equity crossing the line.
+        equity = None
         try:
             equity = float(self.get_account().equity)
             self._last_equity = equity
@@ -2025,6 +2027,20 @@ class MultiSymbolPaperTrader:
             logger.error(f"fast-watch rails check failed: {e}")
 
         open_syms = [s for s in list(self.all_symbols) if self.in_position.get(s)]
+
+        # v3.7.8: proof-of-life every 10 min. A target-halted, flat-book night
+        # produces ZERO other log lines (the halted-entry skip path is silent
+        # and the fast-watch only speaks when it acts), so "alive but idle"
+        # looked identical to "hung" (2026-11-04: user couldn't tell).
+        now = time.time()
+        if now - self._fw_log_ts >= 600:
+            self._fw_log_ts = now
+            mode = ('TARGET BANKED - entries halted' if self._daily_target_halted
+                    else ('LOSS LIMIT - entries halted' if self._daily_loss_halted
+                          else 'trading'))
+            eq_txt = f"${equity:,.2f}" if equity else "unavailable"
+            logger.info(f"fast-watch alive: equity={eq_txt} | day=${self._day_pnl_usd:+,.2f} "
+                        f"| open positions={len(open_syms)} | mode={mode}")
         if not open_syms:
             return
 
