@@ -135,6 +135,7 @@ import sys
 import time
 import logging
 import re
+import json
 import subprocess
 import numpy as np
 import pandas as pd
@@ -148,7 +149,7 @@ except ImportError:
 
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
@@ -161,6 +162,7 @@ from config.settings import config
 from src.models.meta_learner import MetaLearner
 from src.ingestion.indicator_calculator import calculate_all_indicators
 from src.utils.telegram import send_telegram
+from src.utils.alerter import send_critical_alert, ping_healthcheck
 from src.utils.reporter import send_eod_report, format_capital_update
 from src.utils.logger import setup_logger
 
@@ -266,7 +268,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.5"
+TRADER_VERSION = "v3.7.6"
 
 # Ghost-trader / runaway detection (v3.5.2)
 SIZE_DRIFT_TOLERANCE = 0.02       # >2% qty change w/o our order => foreign trade
@@ -293,6 +295,12 @@ BUYING_POWER_USAGE_CAP = getattr(config, 'BUYING_POWER_USAGE_CAP', 0.95)
 ADOPT_FALLBACK_SL_PCT = 0.05           # emergency bracket if ATR is unavailable at adoption
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# v3.7.6: durability + phone alarms (user mandate: the bot must not depend on
+# the laptop staying alive, and critical events must RING the phone)
+SERVER_SIDE_STOPS_ENABLED = getattr(config, 'SERVER_SIDE_STOPS_ENABLED', True)
+CLOSE_WINNERS_ON_TARGET = getattr(config, 'CLOSE_WINNERS_ON_TARGET', True)
+STATE_FILE = os.path.join(PROJECT_ROOT, getattr(config, 'STATE_FILE', 'data/live_state.json'))
 
 
 class MultiSymbolPaperTrader:
@@ -385,6 +393,19 @@ class MultiSymbolPaperTrader:
         self._next_maintenance = self._initial_maintenance_time()
         if DAILY_MAINTENANCE_ENABLED and self._next_maintenance is not None:
             logger.info(f"Daily maintenance: next run at {self._next_maintenance.isoformat()}")
+
+        # v3.7.6: broker-side disaster stops + restart-proof state. The
+        # bot-side stop dies with the laptop; a REAL stop order resting at
+        # Alpaca does not. And the day rails / locks / stops are persisted to
+        # data/live_state.json so a restart no longer forgets them (2026-11-04:
+        # PLTR's breakeven+ lock at $170.05 was lost on a watchdog restart and
+        # the adoption re-armed the full-risk $161.78 bracket).
+        self._server_stop_id: Dict[str, Optional[str]] = {s: None for s in self.all_symbols}
+        self._server_stop_synced: Dict[str, Optional[tuple]] = {s: None for s in self.all_symbols}
+        self._server_stop_alerted: Dict[str, float] = {}
+        self._saved_state = self._load_state()
+        self._last_saved_json = ""
+        self._restore_rails_from_state()
 
         # Adopt any positions the broker already holds (opened before this
         # process started - restart, crash, or manual). They are managed
@@ -561,7 +582,8 @@ class MultiSymbolPaperTrader:
     def cancel_symbol_orders(self, symbol: str):
         try:
             for o in self.trading_client.get_orders():
-                if o.symbol == self._pos_key(symbol) and o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
+                if o.symbol == self._pos_key(symbol) and o.status in (
+                        OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED, OrderStatus.ACCEPTED):
                     self.trading_client.cancel_order_by_id(o.id)
         except Exception as e:
             logger.error(f"{symbol} cancel orders failed: {e}")
@@ -653,6 +675,10 @@ class MultiSymbolPaperTrader:
                     f"position is still OPEN. Last error: {self.last_order_error.get(symbol, '?')}. "
                     f"Check the Alpaca dashboard - and check for a SECOND trader on this account.",
                     'warning')
+                send_critical_alert(
+                    f"Nexus: {symbol} close REJECTED {fails}x",
+                    f"Broker keeps rejecting the close and the position is still OPEN. "
+                    f"Last error: {self.last_order_error.get(symbol, '?')}. Check Alpaca NOW.")
             if not ok:
                 return False
         price = self.get_latest_price(symbol)
@@ -699,6 +725,7 @@ class MultiSymbolPaperTrader:
             self.stop_history[symbol] = [t for t in self.stop_history[symbol] if t >= cutoff]
         self._reset_position_state(symbol)
         self.cooldown[symbol] = COOLDOWN_BARS
+        self._save_state()
         send_telegram(
             f"{symbol} closed ({reason})\n"
             f"PnL: ${pnl:+.2f} ({r_mult:+.1f}R) | held {hold_h:.1f}h\n"
@@ -734,6 +761,168 @@ class MultiSymbolPaperTrader:
         self._last_brain[symbol] = None
         self.day_lock_set[symbol] = False
         self._loss_leash_alerted[symbol] = False
+        self._server_stop_id[symbol] = None
+        self._server_stop_synced[symbol] = None
+
+    # ================= State persistence (v3.7.6) =================
+    def _load_state(self) -> dict:
+        """Load data/live_state.json (rails + per-symbol brackets) written by
+        _save_state. Any problem -> empty state; never crash the boot."""
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            if isinstance(state, dict):
+                return state
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"saved state unreadable ({e}) - starting fresh")
+        return {}
+
+    def _save_state(self):
+        """Persist the day rails and every open position's bracket + lock
+        flags, atomically, so a restart/power loss never forgets them.
+        Skips the write when nothing changed."""
+        try:
+            symbols = {}
+            for s in self.all_symbols:
+                if not self.in_position.get(s):
+                    continue
+                symbols[s] = {
+                    'side': self.position_side.get(s),
+                    'entry': self.entry_price.get(s),
+                    'stop_loss': self.stop_loss.get(s),
+                    'take_profit': self.take_profit.get(s),
+                    'day_lock_set': bool(self.day_lock_set.get(s)),
+                    'breakeven_set': bool(self.breakeven_set.get(s)),
+                    'ratchet_done': bool(self.ratchet_done.get(s)),
+                    'entry_bar_time': (self.entry_bar_time.get(s).isoformat()
+                                       if self.entry_bar_time.get(s) else None),
+                }
+            state = {
+                'rail_day': self._rail_day.isoformat() if self._rail_day else None,
+                'rail_start_equity': self._rail_start_equity,
+                'daily_target_halted': bool(self._daily_target_halted),
+                'daily_loss_halted': bool(self._daily_loss_halted),
+                'symbols': symbols,
+            }
+            blob = json.dumps(state)
+            if blob == self._last_saved_json:
+                return
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(blob)
+            os.replace(tmp, STATE_FILE)
+            self._last_saved_json = blob
+        except Exception as e:
+            logger.error(f"state save failed (non-fatal): {e}")
+
+    def _restore_rails_from_state(self):
+        """A restart must not reset the day's P&L baseline or forget that the
+        profit target / loss limit already fired today (2026-11-04: the +$103
+        target halt vanished when the watchdog restarted the process)."""
+        saved = self._saved_state or {}
+        today = datetime.now(timezone.utc).date().isoformat()
+        if saved.get('rail_day') == today and saved.get('rail_start_equity'):
+            self._rail_day = datetime.now(timezone.utc).date()
+            self._rail_start_equity = float(saved['rail_start_equity'])
+            self._daily_target_halted = bool(saved.get('daily_target_halted'))
+            self._daily_loss_halted = bool(saved.get('daily_loss_halted'))
+            logger.info(f"Rails restored from saved state: baseline ${self._rail_start_equity:,.2f} "
+                        f"(target halted={self._daily_target_halted}, loss halted={self._daily_loss_halted})")
+
+    # ================= Broker-side disaster stops (v3.7.6) =================
+    def _cancel_server_stop(self, symbol: str):
+        oid = self._server_stop_id.get(symbol)
+        self._server_stop_id[symbol] = None
+        self._server_stop_synced[symbol] = None
+        if oid:
+            try:
+                self.trading_client.cancel_order_by_id(oid)
+            except Exception:
+                pass
+
+    def _sync_server_stop(self, symbol: str):
+        """Keep a REAL stop order resting at Alpaca for every stock position.
+        The bot-side stop only exists while this process is alive - the
+        2026-11-04 power loss left PLTR naked. A GTC stop order at the broker
+        keeps protecting the position through power loss / internet outage /
+        crashes. It mirrors the bot's current stop (cancelled first on any
+        bot-initiated close, so it can never double-sell). Stocks only:
+        Alpaca crypto does not support plain stop orders."""
+        if not SERVER_SIDE_STOPS_ENABLED or self._is_crypto(symbol):
+            return
+        if not self.in_position.get(symbol):
+            return
+        side = self.position_side.get(symbol)
+        stop = self.stop_loss.get(symbol)
+        if side not in ('LONG', 'SHORT') or not stop or stop <= 0:
+            return
+        qty = int(abs(self.get_position_qty(symbol)))
+        if qty <= 0:
+            return
+        stop = round(stop, 2)
+        want = (stop, qty)
+        oid = self._server_stop_id.get(symbol)
+        if oid and self._server_stop_synced.get(symbol) == want:
+            return                                    # already in sync
+        try:
+            if oid:
+                self.trading_client.replace_order_by_id(
+                    oid, ReplaceOrderRequest(qty=qty, stop_price=stop))
+            else:
+                order_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
+                o = self.trading_client.submit_order(order_data=StopOrderRequest(
+                    symbol=self._pos_key(symbol), qty=qty, side=order_side,
+                    time_in_force=TimeInForce.GTC, stop_price=stop))
+                self._server_stop_id[symbol] = o.id
+                logger.info(f"{symbol} broker-side disaster stop placed @ ${stop:.2f} x {qty} "
+                            f"(protects even if this laptop dies)")
+            self._server_stop_synced[symbol] = want
+        except Exception as e:
+            # stale order id (filled/cancelled while we were down) -> drop it,
+            # the next cycle places a fresh one
+            self._server_stop_id[symbol] = None
+            self._server_stop_synced[symbol] = None
+            now = time.time()
+            if now - self._server_stop_alerted.get(symbol, 0) > 3600:
+                self._server_stop_alerted[symbol] = now
+                logger.error(f"{symbol} broker-side stop sync failed: {e}")
+                send_telegram(f"⚠️ {symbol}: could not place/update the broker-side disaster stop "
+                              f"({e}). Position is protected by the bot only until this succeeds.",
+                              'warning')
+
+    def _close_winners_now(self):
+        """v3.7.6 (user mandate): when the daily profit target trips, BANK the
+        day immediately - market-close every position that is in profit, don't
+        sit and hope the trail holds. Positions in the red are NOT touched;
+        they keep their normal exit rules (no arbitrary closes). Stocks are
+        skipped off-hours (a market order can't fill); their stops stay armed
+        and EOD flatten owns the bell."""
+        market_open = self._market_open()
+        for sym in list(self.all_symbols):
+            if not self.in_position.get(sym):
+                continue
+            try:
+                if not self._is_crypto(sym) and not market_open:
+                    continue
+                side = self.position_side.get(sym)
+                entry = self.entry_price.get(sym) or 0.0
+                px = self.get_latest_price(sym)
+                if px is None or entry <= 0 or side is None:
+                    continue
+                in_profit = (side == 'LONG' and px > entry) or (side == 'SHORT' and px < entry)
+                if not in_profit:
+                    logger.info(f"{sym} DAILY_TARGET: in the red - left to its exit rules")
+                    continue
+                qty = abs(self.get_position_qty(sym))
+                if qty > 0:
+                    logger.info(f"{sym} DAILY_TARGET: banking winner NOW at market "
+                                f"(${px:.2f} vs entry ${entry:.2f})")
+                    self.close_position(sym, qty, 'DAILY_TARGET')
+            except Exception as e:
+                logger.error(f"{sym} DAILY_TARGET close failed: {e}")
 
     # ================= Broker reconcile / adoption (v3.4) =================
     def _reconcile_positions(self):
@@ -817,6 +1006,10 @@ class MultiSymbolPaperTrader:
         for s in list(self.all_symbols):
             if self.in_position.get(s) and self._pos_key(s) not in broker:
                 logger.info(f"{s} no longer held at broker (closed while down or manually) - clearing state")
+                # v3.7.6: cancel any resting disaster stop too - if the position
+                # was closed manually, a forgotten GTC stop would later fire and
+                # open a NAKED position in the wrong direction.
+                self.cancel_symbol_orders(s)
                 self._reset_position_state(s)
                 send_telegram(f"{s} position no longer at the broker - stopped tracking "
                               f"(closed while I was down?)", 'info')
@@ -851,6 +1044,9 @@ class MultiSymbolPaperTrader:
             f"I will manage it with the normal exit rules (no blind close), but you should "
             f"check the Alpaca order history and look for a second trader.",
             'warning')
+        send_critical_alert(f"Nexus: RUNAWAY {symbol} position",
+                            f"${notional:,.0f} notional = {notional / slice_cap:.1f}x its slice. "
+                            f"Not from the strategy - check Alpaca for a second trader.")
 
     def _adopt_position(self, symbol: str, signed_qty: float, avg_entry: float):
         side = 'LONG' if signed_qty > 0 else 'SHORT'
@@ -888,12 +1084,43 @@ class MultiSymbolPaperTrader:
         self.stop_loss[symbol] = (avg_entry - sl_dist) if side == 'LONG' else (avg_entry + sl_dist)
         self.take_profit[symbol] = (avg_entry + tp_dist) if side == 'LONG' else (avg_entry - tp_dist)
 
+        # v3.7.6: restore the SAVED bracket if it is tighter than the fresh
+        # ATR one. 2026-11-04: PLTR's daily-target lock ($170.05) was forgotten
+        # on a watchdog restart and the adoption re-armed the full-risk
+        # $161.78 stop - the lock the trader had already banked vanished.
+        saved = (self._saved_state.get('symbols', {}) or {}).get(symbol)
+        restored_note = ""
+        if saved and saved.get('side') == side and saved.get('entry') \
+                and abs(saved['entry'] - avg_entry) / avg_entry < 0.02:
+            saved_sl = saved.get('stop_loss')
+            if saved_sl:
+                tighter = (side == 'LONG' and saved_sl > self.stop_loss[symbol]) or \
+                          (side == 'SHORT' and saved_sl < self.stop_loss[symbol])
+                if tighter:
+                    self.stop_loss[symbol] = saved_sl
+                    restored_note = f" | restored tighter saved SL ${saved_sl:.2f}"
+            self.day_lock_set[symbol] = bool(saved.get('day_lock_set'))
+            self.breakeven_set[symbol] = bool(saved.get('breakeven_set'))
+            self.ratchet_done[symbol] = bool(saved.get('ratchet_done'))
+            if saved.get('entry_bar_time'):
+                try:
+                    self.entry_bar_time[symbol] = datetime.fromisoformat(saved['entry_bar_time'])
+                except Exception:
+                    pass
+        # v3.7.6: drop any orphan resting orders from before the restart, then
+        # place the fresh disaster stop at the (possibly restored) bracket.
+        self.cancel_symbol_orders(symbol)
+        self._server_stop_id[symbol] = None
+        self._server_stop_synced[symbol] = None
+        self._sync_server_stop(symbol)
+        self._save_state()
+
         logger.info(f"ADOPTED {symbol} {side} {qty} @ {avg_entry:.2f} - {bracket_note}: "
-                    f"SL={self.stop_loss[symbol]:.2f} TP={self.take_profit[symbol]:.2f}")
+                    f"SL={self.stop_loss[symbol]:.2f} TP={self.take_profit[symbol]:.2f}{restored_note}")
         send_telegram(
             f"ADOPTED {symbol} {side} {qty} @ ${avg_entry:.2f} (existed before restart)\n"
             f"Bracket rebuilt: SL ${self.stop_loss[symbol]:.2f} | "
-            f"TP ${self.take_profit[symbol]:.2f} ({bracket_note})\n"
+            f"TP ${self.take_profit[symbol]:.2f} ({bracket_note}){restored_note}\n"
             f"Now managed with the same rules as new trades - no blind closes.", 'entry')
 
     # ================= Sizing =================
@@ -1360,6 +1587,10 @@ class MultiSymbolPaperTrader:
             f"Analysis: regime={_reg or '?'} | sentiment={_sent:+.2f} | "
             f"vetoes passed: sentiment, regime, momentum, session-open", 'entry')
         logger.info(f"{symbol} {side} entered @ {price:.2f} qty={actual_qty}")
+        # v3.7.6: the disaster stop rests at the BROKER from second one -
+        # protection no longer depends on this laptop staying alive.
+        self._sync_server_stop(symbol)
+        self._save_state()
 
     # ================= Exit management =================
     def _bars_in_position(self, symbol: str) -> float:
@@ -1514,6 +1745,12 @@ class MultiSymbolPaperTrader:
                     close_qty = qty * config.SCALE_OUT_PCT
                     close_qty = round(close_qty, 6) if self._is_crypto(symbol) else int(close_qty)
                     if close_qty > 0:
+                        # v3.7.6: the resting disaster stop holds these shares
+                        # at Alpaca - a partial sell would be REJECTED
+                        # ("insufficient qty available") unless the stop is
+                        # dropped first. _sync_server_stop re-places it for the
+                        # reduced size at the end of this cycle.
+                        self._cancel_server_stop(symbol)
                         close_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
                         if self._execute_order(symbol, close_side, close_qty, f"SCALE_OUT({label})"):
                             done[symbol] = True
@@ -1575,6 +1812,7 @@ class MultiSymbolPaperTrader:
                 close_qty = qty * 0.5
                 close_qty = round(close_qty, 6) if self._is_crypto(symbol) else int(close_qty)
                 if close_qty > 0:
+                    self._cancel_server_stop(symbol)   # v3.7.6: same held-shares issue as scale-outs
                     close_side = OrderSide.SELL if side == 'LONG' else OrderSide.BUY
                     if self._execute_order(symbol, close_side, close_qty, "TIME_PARTIAL"):
                         self.time_partial_done[symbol] = True
@@ -1702,6 +1940,8 @@ class MultiSymbolPaperTrader:
                     try:
                         send_telegram(f"⚠️ Trader froze (no cycle for {stale / 60:.0f} min, likely a hung "
                                       f"network call) - auto-restarting now. Positions will be re-adopted.", 'warning')
+                        send_critical_alert("Nexus: trader froze - auto-restarting",
+                                            f"No cycle for {stale / 60:.0f} min (hung network call). Supervisor restarts it; positions keep their broker-side stops.")
                     except Exception:
                         pass
                     os._exit(42)
@@ -1759,6 +1999,7 @@ class MultiSymbolPaperTrader:
             self._daily_target_halted = False
             logger.info(f"Daily rails reset for {today}: start equity ${equity:,.2f} "
                         f"(target +${DAILY_PROFIT_TARGET_USD:,.0f} / limit -${DAILY_LOSS_LIMIT_USD:,.0f})")
+            self._save_state()
         day_pnl = equity - self._rail_start_equity
         self._day_pnl_usd = day_pnl
         if DAILY_LOSS_LIMIT_USD > 0 and day_pnl <= -DAILY_LOSS_LIMIT_USD:
@@ -1767,13 +2008,24 @@ class MultiSymbolPaperTrader:
                 logger.warning(f"DAILY LOSS LIMIT hit: day P&L ${day_pnl:+,.0f} - entries halted")
                 send_telegram(f"🛑 DAILY LOSS LIMIT hit: ${day_pnl:+,.0f} (limit -${DAILY_LOSS_LIMIT_USD:,.0f})\n"
                               f"No new entries today. Open positions still managed by their exit rules.", 'warning')
+                send_critical_alert("Nexus: DAILY LOSS LIMIT hit",
+                                    f"Day P&L ${day_pnl:+,.0f}. Entries halted - open trades on a tight leash.")
+                self._save_state()
         elif DAILY_PROFIT_TARGET_USD > 0 and day_pnl >= DAILY_PROFIT_TARGET_USD:
             if not self._daily_target_halted:
                 self._daily_target_halted = True
                 logger.info(f"DAILY PROFIT TARGET hit: day P&L ${day_pnl:+,.0f} - entries halted, "
-                            f"open winners locking at breakeven+")
+                            f"banking open winners NOW")
                 send_telegram(f"🎯 DAILY PROFIT TARGET hit: ${day_pnl:+,.0f} (target +${DAILY_PROFIT_TARGET_USD:,.0f})\n"
-                              f"No new entries today - open winners lock at breakeven+ so the win can't bleed back.", 'target')
+                              f"Banking every position in profit at market NOW. Entries halted for today.", 'target')
+                send_critical_alert("Nexus: DAILY PROFIT TARGET hit",
+                                    f"Day P&L ${day_pnl:+,.0f} - banking open winners now. Done for today.")
+                self._save_state()
+                # v3.7.6 (user mandate): bank the day IMMEDIATELY - close every
+                # position in profit at market instead of only locking stops.
+                # Red positions are untouched (their exit rules still own them).
+                if CLOSE_WINNERS_ON_TARGET:
+                    self._close_winners_now()
 
     def _check_daily_reset(self, symbol: str, equity: float):
         today = datetime.now(timezone.utc).date()
@@ -1991,6 +2243,12 @@ class MultiSymbolPaperTrader:
                                 qty = abs(self.get_position_qty(symbol))
                                 if qty > 0:
                                     self.close_position(symbol, qty, reason)
+                            else:
+                                # v3.7.6: keep the broker-side disaster stop
+                                # mirrored to the bot's current stop (trailing
+                                # moves, locks, leashes) and persist state.
+                                self._sync_server_stop(symbol)
+                                self._save_state()
                         else:
                             can_trade, why = self._daily_guard(symbol, equity)
                             if not can_trade:
@@ -2009,6 +2267,7 @@ class MultiSymbolPaperTrader:
                         self._send_eod()
 
                 self._cycle_heartbeat = time.time()   # v3.7.4 watchdog stamp
+                ping_healthcheck()                    # v3.7.6 dead-man's switch
                 time.sleep(CHECK_INTERVAL)
 
             except KeyboardInterrupt:
@@ -2020,6 +2279,7 @@ class MultiSymbolPaperTrader:
                 # watchdog here too so a long outage never triggers a restart;
                 # only a true silent hang does.
                 self._cycle_heartbeat = time.time()
+                ping_healthcheck()
                 logger.error(f"Main loop error: {e}")
                 time.sleep(60)
 
