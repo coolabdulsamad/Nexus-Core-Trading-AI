@@ -269,7 +269,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.9"
+TRADER_VERSION = "v3.7.10"
 
 # v3.7.7 (user mandate "check every second, close fast, close before the
 # bell"): a lightweight fast-watch thread checks the equity rails and every
@@ -309,6 +309,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 # the laptop staying alive, and critical events must RING the phone)
 SERVER_SIDE_STOPS_ENABLED = getattr(config, 'SERVER_SIDE_STOPS_ENABLED', True)
 CLOSE_WINNERS_ON_TARGET = getattr(config, 'CLOSE_WINNERS_ON_TARGET', True)
+# v3.7.10: opt-in only - whether a position ADOPTED into a target-halted day
+# (e.g. an entry that filled late) gets banked immediately. Default OFF per
+# user decision 2026-11-05: let adopted trades run their normal exit rules
+# (scale-outs / trailing stop / TP / EOD flatten). The pending-entry cancel
+# on halt already prevents late fills in the first place.
+ADOPT_BANK_ON_TARGET = os.getenv("ADOPT_BANK_ON_TARGET", "false").lower() == "true"
 STATE_FILE = os.path.join(PROJECT_ROOT, getattr(config, 'STATE_FILE', 'data/live_state.json'))
 
 
@@ -1181,12 +1187,11 @@ class MultiSymbolPaperTrader:
             f"TP ${self.take_profit[symbol]:.2f} ({bracket_note}){restored_note}\n"
             f"Now managed with the same rules as new trades - no blind closes.", 'entry')
 
-        # v3.7.9: adopted into a TARGET-HALTED day (e.g. an entry order placed
-        # before the halt that filled late). The target rule owns it: bank it
-        # now if it's a winner; if it's red its normal exit rules keep it -
-        # no arbitrary closes. (2026-11-05: NVDA filled 2.5 min after the
-        # profit-target halt and sat open all afternoon.)
-        if self._daily_target_halted and CLOSE_WINNERS_ON_TARGET:
+        # v3.7.9/v3.7.10: adopted into a TARGET-HALTED day (e.g. an entry
+        # order placed before the halt that filled late). OPT-IN ONLY
+        # (ADOPT_BANK_ON_TARGET=true): bank it now if it's a winner.
+        # Default is OFF - adopted trades keep their normal exit rules.
+        if self._daily_target_halted and ADOPT_BANK_ON_TARGET:
             try:
                 if self._is_crypto(symbol) or self._market_open():
                     px = self.get_latest_price(symbol)
