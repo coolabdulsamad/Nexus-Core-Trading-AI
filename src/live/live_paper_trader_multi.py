@@ -269,7 +269,7 @@ COOLDOWN_BARS = config.COOLDOWN_BARS
 
 MAX_DATA_AGE_SECONDS = 7200       # 1h bars: accept up to 2h old (hourly cadence)
 
-TRADER_VERSION = "v3.7.8"
+TRADER_VERSION = "v3.7.9"
 
 # v3.7.7 (user mandate "check every second, close fast, close before the
 # bell"): a lightweight fast-watch thread checks the equity rails and every
@@ -934,6 +934,21 @@ class MultiSymbolPaperTrader:
                               f"({e}). Position is protected by the bot only until this succeeds.",
                               'warning')
 
+    def _cancel_pending_entries(self):
+        """v3.7.9: when a daily rail trips, cancel resting orders on FLAT
+        symbols. A pending entry that fills AFTER the halt reopens exposure
+        on a day that is already banked/protected (2026-11-05: NVDA entry
+        showed NOT FILLED, then filled 2.5 min after the profit-target halt).
+        Open positions are skipped - their resting orders are disaster stops,
+        which must stay."""
+        for sym in list(self.all_symbols):
+            if self.in_position.get(sym):
+                continue
+            try:
+                self.cancel_symbol_orders(sym)
+            except Exception as e:
+                logger.error(f"{sym} pending-entry cancel failed: {e}")
+
     def _close_winners_now(self):
         """v3.7.6 (user mandate): when the daily profit target trips, BANK the
         day immediately - market-close every position that is in profit, don't
@@ -1165,6 +1180,25 @@ class MultiSymbolPaperTrader:
             f"Bracket rebuilt: SL ${self.stop_loss[symbol]:.2f} | "
             f"TP ${self.take_profit[symbol]:.2f} ({bracket_note}){restored_note}\n"
             f"Now managed with the same rules as new trades - no blind closes.", 'entry')
+
+        # v3.7.9: adopted into a TARGET-HALTED day (e.g. an entry order placed
+        # before the halt that filled late). The target rule owns it: bank it
+        # now if it's a winner; if it's red its normal exit rules keep it -
+        # no arbitrary closes. (2026-11-05: NVDA filled 2.5 min after the
+        # profit-target halt and sat open all afternoon.)
+        if self._daily_target_halted and CLOSE_WINNERS_ON_TARGET:
+            try:
+                if self._is_crypto(symbol) or self._market_open():
+                    px = self.get_latest_price(symbol)
+                    if px and ((side == 'LONG' and px > avg_entry) or
+                               (side == 'SHORT' and px < avg_entry)):
+                        logger.info(f"{symbol} DAILY_TARGET: adopted late into a banked day - "
+                                    f"banking winner NOW (${px:.2f} vs entry ${avg_entry:.2f})")
+                        send_telegram(f"🎯 {symbol} filled AFTER the daily target was banked - "
+                                      f"closing it at market per the target rule.", 'target')
+                        self.close_position(symbol, qty, 'DAILY_TARGET')
+            except Exception as e:
+                logger.error(f"{symbol} adopt-bank failed: {e}")
 
     # ================= Sizing =================
     def _quality_tier(self, quality: float) -> str:
@@ -2185,6 +2219,7 @@ class MultiSymbolPaperTrader:
                               f"No new entries today. Open positions still managed by their exit rules.", 'warning')
                 send_critical_alert("Nexus: DAILY LOSS LIMIT hit",
                                     f"Day P&L ${day_pnl:+,.0f}. Entries halted - open trades on a tight leash.")
+                self._cancel_pending_entries()   # v3.7.9: no late entry fills on a halted day
                 self._save_state()
         elif DAILY_PROFIT_TARGET_USD > 0 and day_pnl >= DAILY_PROFIT_TARGET_USD:
             if not self._daily_target_halted:
@@ -2199,6 +2234,7 @@ class MultiSymbolPaperTrader:
                 # v3.7.6 (user mandate): bank the day IMMEDIATELY - close every
                 # position in profit at market instead of only locking stops.
                 # Red positions are untouched (their exit rules still own them).
+                self._cancel_pending_entries()   # v3.7.9: cancel resting entries FIRST so none can fill after the halt
                 if CLOSE_WINNERS_ON_TARGET:
                     self._close_winners_now()
 
