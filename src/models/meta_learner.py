@@ -36,6 +36,8 @@ v2.3.0 (quality-formula fix, measured on 52,373 live readings Sep 15-Oct 13)
   Advisory fallback quality lowered 0.10 -> 0.005 so a blind brain still
   stands down under the new floor.
 """
+import time
+
 import numpy as np
 import pandas as pd
 from config.settings import config
@@ -58,6 +60,50 @@ class MetaLearner:
         self.encoder = VectorEncoder()
         self.memory = QdrantMemory()
         self.news = NewsOrchestrator() if config.USE_REAL_SENTIMENT else None
+        # v3.7.11: memory-bank health tracking for phone alerting
+        self._mem_fail_streak = 0
+        self._mem_alerted = False
+        self._mem_alert_ts = 0.0
+
+    # ------------------------------------------------------------------
+    # v3.7.11: memory-bank health alerting. The brain stands down (HOLD)
+    # whenever a Qdrant search fails; repeated failures mean the Docker
+    # qdrant container is going bad (2026-11-06 -> 11-24: intermittent
+    # failures for 18 days, cured instantly by a Docker restart). Alert
+    # the phone after 5 consecutive failures (max 1/hour) + on recovery.
+    # Alerting must never raise - it guards the brain, it may not break it.
+    def _note_memory_failure(self, err: str):
+        self._mem_fail_streak += 1
+        if self._mem_fail_streak >= 5 and time.time() - self._mem_alert_ts > 3600:
+            self._mem_alert_ts = time.time()
+            self._mem_alerted = True
+            msg = (f"🧠 MEMORY BANK FAILING: {self._mem_fail_streak} consecutive Qdrant "
+                   f"errors - the brain is standing down (no new entries) until fixed.\n"
+                   f"Fix: check Docker, then restart the qdrant container.\n"
+                   f"Last error: {err[:200]}")
+            try:
+                from src.utils.telegram import send_telegram
+                send_telegram(msg, 'warning')
+            except Exception:
+                pass
+            try:
+                from src.utils.alerter import send_critical_alert
+                send_critical_alert("Nexus: MEMORY BANK failing",
+                                    f"{self._mem_fail_streak} consecutive Qdrant errors - brain is blind. "
+                                    f"Restart the qdrant Docker container. Last: {err[:200]}")
+            except Exception:
+                pass
+
+    def _note_memory_success(self):
+        if self._mem_fail_streak:
+            if self._mem_alerted:
+                try:
+                    from src.utils.telegram import send_telegram
+                    send_telegram("✅ Memory bank recovered - Qdrant answering again, brain fully online.", 'info')
+                except Exception:
+                    pass
+                self._mem_alerted = False
+            self._mem_fail_streak = 0
 
     # ------------------------------------------------------------------
     def _sigmoid(self, x):
@@ -117,8 +163,11 @@ class MetaLearner:
                 )
         except Exception as e:
             logger.error(f"Qdrant search failed: {e}")
+            self._note_memory_failure(str(e))
             return {'symbol': symbol, 'signal': 'HOLD', 'confidence': 0.5,
                     'quality': 0.0, 'reason': 'memory_error'}
+
+        self._note_memory_success()
 
         # ---- 4. Filter neighbours: usable outcomes + similarity floor ----
         usable = [h for h in hits
